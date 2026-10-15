@@ -169,6 +169,6 @@ typeName)`, `abfStatus()`, `abfStop()`.
 откройте issue или напишите на but.nikolay@gmail.com.
 
 Пригодилось? Поддержать разработку можно через
-[GitHub Sponsors](https://github.com/sponsors/mflow42).
+[Boosty](https://boosty.to/mflow42/donate).
 
 И — только одиночные игры.

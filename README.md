@@ -177,7 +177,7 @@ its code into a product, paid services, distributions that charge money)
 requires a separate license from the author — open an issue or write to
 but.nikolay@gmail.com.
 
-Found it useful? A GitHub Sponsor star keeps development going:
-[github.com/sponsors/mflow42](https://github.com/sponsors/mflow42).
+Found it useful? Support development on
+[Boosty](https://boosty.to/mflow42/donate).
 
 Again: single-player games only.
