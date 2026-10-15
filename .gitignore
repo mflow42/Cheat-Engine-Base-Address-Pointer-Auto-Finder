@@ -1,0 +1,25 @@
+# Local development notes / machine-specific artifacts
+Context.md
+Plan.md
+PointerFinder-dev.CT
+driver/
+*.log
+
+# Tool output (written to %TEMP% at runtime; old copies may exist locally)
+pointerfinder_log*.txt
+autobase_log*.txt
+PointerFinder_selfcheck.txt
+
+# Python
+__pycache__/
+*.pyc
+
+# Build artifacts
+testtarget/target_game.exe
+testtarget/*.o
+
+# ZCode workspace config (local tool)
+.zcodeignore
+
+# Marketing drafts (local only)
+promo/

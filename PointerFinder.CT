@@ -1,0 +1,3808 @@
+<?xml version="1.0" encoding="utf-8"?>
+<CheatTable CheatEngineVersion="7.4">
+  <CheatEntries>
+  </CheatEntries>
+  <UserdefinedSymbols/>
+  <LuaScript>-- Pointer Finder v2.10 — Cheat Engine table.
+-- The tool code is embedded; this single file is the whole
+-- distribution. Update without reopening CE:
+--   Ctrl+Alt+L (Lua Engine) -&gt; abfReload() -&gt; Execute.
+
+local function stopOld()
+  pcall(function()
+    local A = _G.__PointerFinder
+    if A ~= nil then
+      pcall(function() if A.stopAll ~= nil then A.stopAll(false) end end)
+      pcall(function() if A.timer ~= nil then A.timer.destroy() end end)
+      pcall(function() if A.form ~= nil then A.form.destroy() end end)
+    end
+  end)
+  _G.__PointerFinder = nil
+end
+__PointerFinderSrc = [=[
+--============================================================================
+-- Pointer Finder v2.10 (scan-walk) for Cheat Engine 7.4+ (incl. 7.7), x64 games —
+-- part of the 'Cheat Engine Base Address Pointer Auto Finder' project.
+-- Код грузится загрузчиком из CT (abfReload) — обновляется без переоткрытия CE
+--
+-- Автоматизирует поиск базового (статического) адреса по цепочке указателей:
+--   1. Ставит watchpoint на ваш адрес значения (по умолчанию: запись).
+--   2. Разбирает поймавшуюся инструкцию:
+--        mov [base+disp],src        -&gt; кандидат-родитель: объект = base,
+--                                      оффсет = disp;
+--        mov [base],src  (копия)    -&gt; дизассемблирует назад от RIP и ищет
+--                                      mov src,[base2+disp2] — источник данных;
+--        add/sub [base+disp],src    -&gt; как первый вариант.
+--   3. AOB-сканом (little-endian, 8 байт, writable-память) ищет держатели
+--      указателя на объект и ставит на них access-watchpoints.
+--   4. Поднимается вверх, пока объект не окажется внутри модуля.
+--   5. Добавляет готовую Pointer-запись в адресный лист и пишет путь в лог.
+--
+-- Всё тяжёлое делается в таймере CE, а не в потоке отладчика: колбэк
+-- брейкпоинта только снимает копию регистров и мгновенно продолжает поток.
+--============================================================================
+
+local ABF = _G.__PointerFinder
+if type(ABF) == 'table' and ABF.form ~= nil then
+  local ok = pcall(function() ABF.form.show() end)
+  if ok then return end  -- форма уже жива — просто показать
+end
+
+ABF = {}
+_G.__PointerFinder = ABF
+
+------------------------------------------------------------------ настройки
+ABF.VERSION        = '2.10' -- версия для заставки и диагностики
+ABF.MAX_DEPTH      = 8      -- максимум оффсетов в цепочке
+ABF.MAX_WATCH      = 3      -- только debug-регистры (page-метод роняет игры).
+                            -- v1.99: было 4, но VEH держит один DR под степпинг —
+                            -- 4-й watch CE обслуживает page-guard'ом; на горячей
+                            -- странице игры (все объекты в одном 4КБ) это шторм
+                            -- «соседних» хитов 1.8M за прогон (лог 223037)
+ABF.MAX_HOLDERS    = 3      -- держателей указателя на один объект
+ABF.MAX_BRANCHES   = 64     -- одновременных веток подъёма
+ABF.WALK_BACK      = 6      -- сколько инструкций назад разбирать при копии
+ABF.WALK_SCAN      = 24     -- окно поиска назад от RIP, байт
+ABF.QUEUE_MAX      = 128    -- предел очереди хитов
+ABF.BRANCH_IDLE_MS = 180000 -- ветка без хитов столько мс закрывается (должна переживать паузы между изменениями денег)
+ABF.PROC_PER_TICK  = 24     -- хитов на тик таймера
+ABF.HOT_HITS       = 120    -- шторм-детектор: хитов за окно. v1.73: 30 было
+                            -- слишком чувствительно — живые держатели в горячих
+                            -- циклах Hades читаются 50+/с и навсегда попадали
+                            -- в чёрный список (лог 001156: снята цепочка ур.3)
+ABF.HOT_COOLDOWN_MS = 60000 -- v1.73: чёрный список временный — через минуту
+                            -- адрес получает второй шанс (шторм теперь гасит
+                            -- flood-гейт на входе, blacklist был нужен до него)
+ABF.HOT_WINDOW_MS  = 2000   -- ...за это время -&gt; watch снимается
+ABF.FLOOD_HITS     = 20     -- подавление шторма: больше стольких хитов с одного
+ABF.FLOOD_WINDOW_MS = 1000  -- RIP за окно — остальные дропаются в callback
+ABF.PAIR_TTL_MS    = 30000  -- дедуп: пара (адрес,RIP) не обрабатывается повторно
+ABF.FLOOD_LOG_MS   = 5000   -- как часто логировать подавленный шторм
+ABF.SPEC_TTL_MS    = 8000   -- спекулятивный держатель без хитов столько мс - освобождает слот
+ABF.STAG_MS        = 180000 -- v1.97: столько мс без единого открытия, пока хиты текут,
+                            -- — поиск застрял (page-шторм): перезапуск через fresh-scan
+ABF.PAGE_STORM_N   = 300    -- v1.97: «соседних» page-хитов на одну страницу за окно —
+ABF.PAGE_STORM_MS  = 30000  -- ...снимаем виновный watch и баним адрес до конца поиска
+ABF.LOG_PATH       = (os.getenv('TEMP') or '.') .. [[\pointerfinder_log.txt]]
+ABF.BURST_MS       = 4000   -- бирст: watchpoints стоят столько...
+ABF.PAUSE_MS       = 1000   -- ...потом короткая пауза (игра почти не страдает)
+
+--------------------------------------------------------------- мелкие утилиты
+local fmt    = string.format
+local insert = table.insert
+local remove = table.remove
+
+local function now()
+  local ok, v = pcall(getTickCount)
+  if ok and type(v) == 'number' then return v end
+  return math.floor(os.clock() * 1000)
+end
+
+local function trim(s)
+  return (tostring(s or ''):gsub('^%s*(.-)%s*$', '%1'))
+end
+
+local function hex(v)
+  return fmt('%X', v)
+end
+
+local function offStr(v)
+  if v &lt; 0 then return fmt('-%X', -v) end
+  return fmt('+%X', v)
+end
+
+local function log(msg)
+  local line = os.date('%H:%M:%S') .. '  ' .. tostring(msg)
+  -- дублируем в файл: история переживает вылеты и очистку окна
+  if ABF.fileLogOff ~= true then
+    local okF, f = pcall(io.open, ABF.LOG_PATH, 'a')
+    if okF and f ~= nil then
+      pcall(function()
+        f:write(line .. '\n')
+        f:close()
+      end)
+    else
+      ABF.fileLogFails = (ABF.fileLogFails or 0) + 1
+      if ABF.fileLogFails &gt;= 5 then ABF.fileLogOff = true end
+    end
+  end
+  local memo = ABF.memo
+  if memo == nil then return end
+  pcall(function()
+    local lines = memo.Lines
+    if lines ~= nil then
+      if lines.Count &gt; 800 then
+        lines.clear()
+        lines.add('... log cleared (overflow); full version in pointerfinder_log.txt ...')
+      end
+      lines.add(line)
+    end
+  end)
+end
+
+local function setStatus(s)
+  if ABF.status ~= nil then ABF.status.Caption = (tostring(s)) end
+end
+
+-- v1.80: ТОСТЫ — одноразовые уведомления: безрамочное окно всплывает на 3 с
+-- и исчезает. Плюс ЗВУК: beep слышен в игре всегда (окна поверх
+-- exclusive-fullscreen не покажет никто, а звук — доходит). Заменили
+-- постоянный оверлей v1.77-v1.79, который в игре не было видно.
+local function toast(text, color, beepHz)
+  pcall(function() ABF.toastLbl.Caption = tostring(text) end)
+  pcall(function() ABF.toastLbl.Font.Color = color or 0x00FF00 end)
+  if ABF.toastForm ~= nil then
+    pcall(function()
+      ABF.toastForm.Show()
+      ABF.toastForm.bringToFront()
+    end)
+  end
+  if ABF.toastTm ~= nil then
+    pcall(function() ABF.toastTm.Enabled = false end)
+    pcall(function() ABF.toastTm.Enabled = true end)
+  end
+  if beepHz ~= nil then
+    -- короткий, чтобы не блокировать поток обработки хитов
+    pcall(function() beep(beepHz, 60) end)
+  end
+end
+
+local function toastBuild()
+  local ov = createForm(false)
+  ov.BorderStyle = 'bsNone'
+  ov.FormStyle = 'fsStayOnTop'
+  ov.Width, ov.Height = 360, 34
+  ov.Color = 0x00202020
+  pcall(function()
+    ov.AlphaBlend = true
+    ov.AlphaBlendValue = 220
+  end)
+  local l1 = createLabel(ov)
+  l1.Left, l1.Top, l1.Width = 10, 8, 340
+  l1.Font.Color = 0x00FF00
+  l1.Font.Size = 11
+  l1.Caption = ''
+  local tm = createTimer(nil, false)
+  tm.Interval = 3000
+  tm.OnTimer = function()
+    pcall(function() tm.Enabled = false end)
+    pcall(function() ov.hide() end)
+  end
+  ABF.toastForm, ABF.toastLbl, ABF.toastTm = ov, l1, tm
+  -- v1.82: правый верхний угол. Экранные API (screen/Monitor/getWindowRect)
+  -- в CE Lua не экспортированы (проверено) — якоримся к окну CE: при
+  -- развёрнутом/основном мониторе это и есть правый верхний угол экрана
+  local okA, mfL, mfW, mfT = pcall(function()
+    local mf = getMainForm()
+    return mf.Left, mf.Width, mf.Top
+  end)
+  if okA and type(mfW) == 'number' and mfW &gt; ov.Width + 32 then
+    ov.Left = mfL + mfW - ov.Width - 8
+    ov.Top = mfT + 8
+  else
+    ov.Left = 24
+    ov.Top = 24
+  end
+  ov.hide()  -- показывается только по событию
+end
+
+------------------------------------------------------------ регистры и контекст
+local REG64 = {
+  rax='RAX', rbx='RBX', rcx='RCX', rdx='RDX', rsi='RSI', rdi='RDI',
+  rbp='RBP', rsp='RSP', rip='RIP',
+  r8='R8', r9='R9', r10='R10', r11='R11', r12='R12', r13='R13',
+  r14='R14', r15='R15',
+  -- 32-битные имена приводим к 64-битным (для вычисления адресов хватает)
+  eax='RAX', ebx='RBX', ecx='RCX', edx='RDX', esi='RSI', edi='RDI',
+  ebp='RBP', esp='RSP', eip='RIP',
+}
+local CTX_REGS = {
+  'RAX','RBX','RCX','RDX','RSI','RDI','RBP','RSP',
+  'R8','R9','R10','R11','R12','R13','R14','R15','RIP'
+}
+
+local function isXmm(name)
+  return name:match('^xmm%d+$') ~= nil
+end
+
+local function canonReg(name)
+  return tostring(name):lower()
+end
+
+local function snapshotCtx()
+  -- надёжный источник контекста — debug_getCurrentContextTable;
+  -- глобальные RAX/RIP гарантированы только для debugger_onBreakpoint
+  local t = {}
+  local ok, ctx = pcall(debug_getCurrentContextTable, true)
+  if ok and type(ctx) == 'table' then
+    for _, n in ipairs(CTX_REGS) do
+      local v = ctx[n] or ctx[n:lower()]
+      if v ~= nil then t[n] = v end
+    end
+  end
+  for _, n in ipairs(CTX_REGS) do
+    if t[n] == nil then t[n] = _G[n] end
+  end
+  return t
+end
+
+local function regVal(ctx, name)
+  local g = REG64[tostring(name):lower()]
+  if g == nil then return nil end
+  return ctx[g]
+end
+
+----------------------------------------------------------- разбор инструкций
+local function parseMem(s)
+  local mem = { base=nil, index=nil, scale=1, disp=0, hasRip=false, str=s }
+  local i, n = 1, #s
+  while i &lt;= n do
+    local sign = 1
+    while i &lt;= n do
+      local c = s:sub(i, i)
+      if c == '+' then i = i + 1
+      elseif c == '-' then sign = -sign; i = i + 1
+      else break end
+    end
+    local j = i
+    while j &lt;= n do
+      local c = s:sub(j, j)
+      if c ~= '+' and c ~= '-' then j = j + 1 else break end
+    end
+    local tok = s:sub(i, j - 1)
+    i = j
+    if tok ~= '' then
+      local idxName, sc = tok:match('^([%w]+)%*(%d+)$')
+      if idxName and REG64[idxName:lower()] then
+        mem.index = idxName:lower()
+        mem.scale = tonumber(sc) or 1
+      elseif tok:lower() == 'rip' then
+        mem.hasRip = true
+      elseif tok:sub(1, 2):lower() == '0x' and tonumber(tok:sub(3), 16) then
+        mem.disp = mem.disp + sign * tonumber(tok:sub(3), 16)
+      elseif tok:match('^%x+$') and tonumber(tok, 16) then
+        mem.disp = mem.disp + sign * tonumber(tok, 16)
+      elseif REG64[tok:lower()] then
+        if mem.base == nil then
+          mem.base = tok:lower()
+        elseif mem.index == nil then
+          mem.index = tok:lower()
+          mem.scale = 1
+        else
+          return nil  -- третий регистр в адресе — не разбираю
+        end
+      else
+        return nil  -- незнакомый токен
+      end
+    end
+  end
+  if mem.base == nil and not mem.hasRip then
+    -- CE печатает rip-относительные операнды уже разрешёнными: [0x7FF7EC119080].
+    -- Это статический операнд: disp = полный адрес, совпадение с watch на
+    -- статическую ячейку otherwise невозможно (v1.36)
+    if mem.disp ~= 0 then
+      mem.hasRip = true
+      mem.absAddr = true
+      return mem
+    end
+    return nil
+  end
+  return mem
+end
+
+local function parseOperand(s)
+  s = trim(s)
+  if s:sub(1, 1) == '[' then
+    local inner = s:match('^%[(.*)%]$')
+    if inner == nil then return { kind='other', str=s } end
+    local mem = parseMem(inner)
+    if mem == nil then return { kind='other', str=s } end
+    return { kind='mem', mem=mem, str=s }
+  end
+  if REG64[s:lower()] or isXmm(s:lower()) then
+    return { kind='reg', reg=s:lower(), str=s }
+  end
+  return { kind='other', str=s }
+end
+
+local function safeInstrSize(addr)
+  local ok, sz = pcall(getInstructionSize, addr)
+  if ok and type(sz) == 'number' and sz &gt; 0 and sz &lt;= 15 then return sz end
+  return nil
+end
+
+local function parseInstruction(addr)
+  local ok, dis = pcall(disassemble, addr)
+  if not ok or type(dis) ~= 'string' or dis == '' then return nil end
+  -- формат строки: "ADDRESS - BYTES - OPCODE : EXTRA" — разбираем сами,
+  -- т.к. порядок полей splitDisassembledString плавает между версиями CE
+  -- (в 7.7 в поле opcode попадают БАЙТЫ). Байты содержат пробелы, поэтому
+  -- ищем литеральные разделители " - ".
+  local addrS, bytesS, opcode = nil, nil, nil
+  local p1 = dis:find(' %- ')
+  if p1 ~= nil then
+    local p2 = dis:find(' %- ', p1 + 3)
+    if p2 ~= nil then
+      addrS  = trim(dis:sub(1, p1 - 1))
+      bytesS = trim(dis:sub(p1 + 3, p2 - 1))
+      opcode = trim(dis:sub(p2 + 3))
+    end
+  end
+  if opcode == nil then
+    local ok2, a, b, op = pcall(splitDisassembledString, dis)
+    if not ok2 then return nil end
+    addrS, bytesS, opcode = a, b, op
+  end
+  if opcode == nil then return nil end
+  opcode = trim(opcode)
+  -- защита: если в opcode оказались байты (пары hex) — меняем местами
+  if opcode:match('^%x%x%s+%x%x') then
+    opcode, bytesS = bytesS, opcode
+  end
+  -- срезать ": extra" (жадный поиск до первого ':')
+  local colon = opcode:find(':')
+  if colon ~= nil then
+    opcode = trim(opcode:sub(1, colon - 1))
+  end
+  -- убрать подсказки размера операнда (порядок важен: qword раньше word и т.д.)
+  opcode = opcode:gsub('qword%s+ptr%s*', '')
+  opcode = opcode:gsub('dword%s+ptr%s*', '')
+  opcode = opcode:gsub('xmmword%s+ptr%s*', '')
+  opcode = opcode:gsub('oword%s+ptr%s*', '')
+  opcode = opcode:gsub('tbyte%s+ptr%s*', '')
+  opcode = opcode:gsub('word%s+ptr%s*', '')
+  opcode = opcode:gsub('byte%s+ptr%s*', '')
+  local mnem, rest = opcode:match('^(%S+)%s*(.-)$')
+  if mnem == nil then return nil end
+  rest = (rest or ''):gsub('%s', '')
+  -- разбить операнды по запятым верхнего уровня (вне скобок)
+  local ops, cur, depth = {}, '', 0
+  for ch in rest:gmatch('.') do
+    if ch == '[' then depth = depth + 1
+    elseif ch == ']' then depth = depth - 1 end
+    if ch == ',' and depth == 0 then
+      insert(ops, cur); cur = ''
+    else
+      cur = cur .. ch
+    end
+  end
+  insert(ops, cur)
+  return {
+    addr = addr,
+    len  = safeInstrSize(addr),
+    mnem = mnem:lower(),
+    str  = opcode,
+    op1  = parseOperand(ops[1] or ''),
+    op2  = parseOperand(ops[2] or ''),
+    nops = #ops,
+  }
+end
+
+local function effAddr(mem, ctx)
+  if mem == nil then return nil end
+  local eff = 0
+  if mem.base ~= nil then
+    local bv = regVal(ctx, mem.base)
+    if bv == nil then return nil end
+    eff = eff + bv
+  end
+  if mem.index ~= nil then
+    local iv = regVal(ctx, mem.index)
+    if iv ~= nil then eff = eff + iv * mem.scale end
+  end
+  return eff + mem.disp
+end
+
+-- Все правдоподобные предшественники инструкции по address, новейшие первыми.
+-- Декод с середины инструкции даёт ложные «валидные» старты (хвост настоящей
+-- инструкции `89 06` декодируется как `mov [rsi],eax` и перехватывает цепочку),
+-- поэтому собираем ВСЕ ветки: ложные просто не совпадут с watch-адресом
+-- семантически, а настоящая будет найдена.
+local function findPredecessors(address)
+  local out = {}
+  local seen = {}
+  local function walk(cur, depth)
+    if depth &lt;= 0 then return end
+    local starts = {}
+    local st = cur - 1
+    local lo = cur - ABF.WALK_SCAN
+    while st &gt;= lo do
+      local sz = safeInstrSize(st)
+      if sz ~= nil and st + sz == cur then starts[#starts + 1] = st end
+      st = st - 1
+    end
+    for _, s in ipairs(starts) do
+      if seen[s] == nil then
+        local ins = parseInstruction(s)
+        if ins ~= nil then
+          seen[s] = true
+          out[#out + 1] = ins
+          walk(s, depth - 1)
+        end
+      end
+    end
+  end
+  walk(address, ABF.WALK_BACK)
+  table.sort(out, function(a, b) return a.addr &gt; b.addr end)
+  return out
+end
+
+local LOAD_MNEMS = {
+  mov=true, movsd=true, movss=true, movups=true, movaps=true,
+  movdqu=true, movdqa=true, movq=true, movzx=true, movsxd=true,
+}
+
+-- инструкции, ПИШУЩИЕ в первый (mem) операнд; у остальных mem-операнд читается
+local MEM_WRITE_MNEMS = {
+  mov=true, movsd=true, movss=true, movups=true, movaps=true,
+  movdqa=true, movdqu=true, movq=true,
+  add=true, sub=true, adc=true, sbb=true, xor=true,
+  ['and']=true, ['or']=true,
+  inc=true, dec=true, neg=true, ['not']=true,
+}
+
+-- v1.79: ОПЕРАЦИИ МАССОВОГО КОПИРОВАНИЯ (16/32-байтные SIMD и строковые)
+-- НЕ являются структурными обращениями: при memcpy/memset они кроют наш
+-- адрес «по касательной», а парсер выводит из них фантомного родителя
+-- (Absolum: лестница фантомов +768/+778/+830/+840/+868 и ЛОЖНАЯ находка
+-- 012401 с +760 на конце — всё от vmovdqa/movups/vmovdqu). Скалярные
+-- movsd/movss (8/4 байта) — легитимные писцы значений, не трогаем.
+local BULK_MNEMS = {
+  movups=true, movaps=true, movupd=true, movapd=true,
+  movdqa=true, movdqu=true,
+  vmovups=true, vmovaps=true, vmovupd=true, vmovapd=true,
+  vmovdqa=true, vmovdqu=true, vmovdqu8=true, vmovdqu16=true,
+  vmovdqa8=true, vmovdqa32=true,
+  stosb=true, stosd=true, stosq=true,
+}
+
+------------------------------------------------------------------ watchpoints
+ABF.watches    = {}
+ABF.watchOrder = {}
+ABF.watchCount = 0
+ABF.queue      = {}
+ABF.dropped    = 0
+ABF.running    = false
+ABF.processed  = {}
+ABF.errCount   = 0
+ABF.strayHits  = 0
+ABF.decodeFails = 0
+ABF.hitCount   = 0
+ABF.triedRegBases = {}
+ABF.hotAddrs   = {}
+ABF.ripFlood   = {}   -- v1.70: RIP -&gt; {n, t0, sup, logged} — гейт шторма
+ABF.pairSeen   = {}   -- v1.70: addr -&gt; {rip = t} — дедуп повторных подъёмов
+ABF.burstEnds  = 0
+ABF.nextBurstAt = 0
+ABF.rspSeen    = {}
+ABF.stackRegions = {} -- v1.97: 2МБ-базы всех виденных RSP — стек не забывается
+ABF.pageStorm  = {}   -- v1.97: страница -&gt; {n, t0, done} — рубильник page-шторма
+ABF.pageBanned = {}   -- v1.97: адреса, снятые рубильником, — не перевооружать
+ABF.lastProgress = 0  -- v1.97: время последнего открытия (для детектора стагнации)
+ABF.regionDone = {}
+ABF.specGated  = false
+ABF.maxDepth   = 0
+ABF.lastCopyParent = nil
+ABF.copyReclimbAt = {}  -- v1.74: cooldown повторного клайма источника копии
+ABF.copyWalkFailRip = nil
+ABF.directTried = {}
+
+local removeWatch  -- forward declaration (нужна внутри addWatch)
+
+local function bpCallback(attrAddr)
+  pcall(function()
+    if ABF.running then
+      -- v1.96: точная атрибуция — замыкание addWatch передаёт адрес своего
+      -- watch; счётчики ячейки живём даже когда декод хита не удался
+      local wAttr = attrAddr ~= nil and ABF.watches[attrAddr] or nil
+      if wAttr ~= nil then
+        wAttr.hits = wAttr.hits + 1
+        for br in pairs(wAttr.branches) do br.lastHit = now() end
+        ABF.lastBrHit = now()
+      end
+      local ctx = snapshotCtx()
+      if ctx.RIP ~= nil then
+        -- копим образцы RSP: по ним отсеиваем стековые держатели (спилы
+        -- регистров копирующих функций) — watch на стеке = шторм и вылет
+        if ctx.RSP ~= nil then
+          -- v1.97: регион стека — в постоянный набор (2МБ-базы не забываются),
+          -- окно 8 RSP остаётся для точных проверок
+          local rb = ctx.RSP - ctx.RSP % 0x200000
+          ABF.stackRegions[rb] = true
+          local seen = false
+          for _, v in ipairs(ABF.rspSeen) do
+            if v == ctx.RSP then seen = true; break end
+          end
+          if not seen then
+            insert(ABF.rspSeen, 1, ctx.RSP)
+            if #ABF.rspSeen &gt; 8 then remove(ABF.rspSeen) end
+          end
+        end
+        ABF.hitCount = ABF.hitCount + 1
+        ABF.lastAnyHit = now()
+        ABF.rearmCount = 0
+        ABF.deadAddrLogged = false
+        -- v1.70: ГЕЙТ ШТОРМА. Горячий цикл игры (обход списка сущностей и т.п.)
+        -- бьёт по одному и тому же RIP тысячи раз в секунду: очередь (128)
+        -- переполняется, полезные хиты гибнут вместе с мусорными, а детектор
+        -- горячего watch (он в processHit) не видит просевший поток. Дропаем
+        -- повторы одного RIP прямо в callback — FLOOD_HITS хитов в секунду
+        -- хватает и на подъём, и на срабатывание шторм-детектора.
+        local tn = now()
+        local f = ABF.ripFlood[ctx.RIP]
+        if f == nil then
+          f = { n = 0, t0 = tn, sup = 0, logged = 0 }
+          ABF.ripFlood[ctx.RIP] = f
+        end
+        f.n = f.n + 1
+        if tn - f.t0 &gt; ABF.FLOOD_WINDOW_MS then
+          f.t0 = tn
+          if f.sup &gt; 0 then
+            ABF.floodHits = (ABF.floodHits or 0) + f.sup
+            if tn - f.logged &gt; ABF.FLOOD_LOG_MS then
+              f.logged = tn
+              log(fmt('[i] flood gate: RIP=%X — %d repeat hit(s) suppressed (keeping %d/s)',
+                ctx.RIP, f.sup, ABF.FLOOD_HITS))
+            end
+            f.sup = 0
+          end
+          f.n = 1
+        elseif f.n &gt; ABF.FLOOD_HITS then
+          f.sup = f.sup + 1
+          -- v1.96: точная атрибуция — замыкание знает адрес своего watch
+          if wAttr ~= nil then
+            wAttr.hits = wAttr.hits + 1
+          else
+            -- v1.91: запасная атрибуция по RIP (если watch уже снят — мимо)
+            local wa = ABF.ripWatch[ctx.RIP]
+            local w2 = wa ~= nil and ABF.watches[wa] or nil
+            if w2 ~= nil then
+              w2.hits = (w2.hits or 0) + 1
+              for br in pairs(w2.branches) do br.lastHit = now() end
+            end
+          end
+          return  -- дроп: не ставим в очередь
+        end
+        -- в шторме (очередь полна) лог хитов глушим — иначе переполняет memo
+        if ABF.hitCount == 1 or
+            (ABF.hitCount &lt;= 10 and #ABF.queue &lt; ABF.QUEUE_MAX / 2) or
+            (ABF.hitCount % 50 == 0 and #ABF.queue &lt; ABF.QUEUE_MAX / 2) then
+          if ABF.hitCount == 1 then
+            -- полный дамп контекста первого хита (диагностика)
+            local keys = {}
+            for k, v in pairs(ctx) do
+              keys[#keys + 1] = tostring(k) .. '=' ..
+                (type(v) == 'number' and hex(v) or tostring(v))
+            end
+            table.sort(keys)
+            log('[i] hit context: ' .. table.concat(keys, ' '))
+          end
+          log(fmt('[i] hit #%d: RIP=%s', ABF.hitCount, hex(ctx.RIP)))
+        end
+        if #ABF.queue &lt; ABF.QUEUE_MAX then
+          insert(ABF.queue, { ctx = ctx, rip = ctx.RIP, t = now(), attr = attrAddr })
+        else
+          ABF.dropped = ABF.dropped + 1
+        end
+      end
+    end
+  end)
+  pcall(debug_continueFromBreakpoint, co_run)
+  return 1  -- UI отладчика не обновлять
+end
+
+-- адрес похож на стек (рядом с одним из виденных RSP)?
+-- v1.97: стек узнаётся по РЕГИОНАМ, а не по окну 8 RSP. Окно забывало стек
+-- потока-писца, как только 8 свежих сэмплов приходили с других потоков, —
+-- стековая копия проходила фильтр, CE ставил её в page-метод, и поток-писец
+-- устраивал шторм на 8 минут (лог 023153: 94k хитов, ноль прогресса).
+local function isStackish(addr)
+  for _, rsp in ipairs(ABF.rspSeen) do
+    if math.abs(addr - rsp) &lt; 0x200000 then return true end
+  end
+  -- монотонный набор 2МБ-регионов, виденных с RSP за весь прогон
+  local base = addr - addr % 0x200000
+  if ABF.stackRegions[base] then return true end
+  -- адрес может лежать в соседнем 2МБ-регионе от виденного (граница стека)
+  if ABF.stackRegions[base - 0x200000] or ABF.stackRegions[base + 0x200000] then
+    return addr % 0x200000 &lt; 0x100000 -- только близко к границе
+  end
+  return false
+end
+
+local function addWatch(addr, kind, size, branch, trigger)
+  -- v1.99: страница под баном за page-шторм — не встаём. Датчик уровня 0 —
+  -- исключение: без него поиск слеп, а его шторм гасит flood-гейт + hot-kill
+  -- его не трогает.
+  local isSensor = (kind == 'write' and addr == ABF.rootAddr)
+  if not isSensor and (ABF.pageBanned[addr] or ABF.pageBanned[addr - addr % 0x1000]) then
+    return false
+  end
+  local hotAt = ABF.hotAddrs[addr]
+  if hotAt ~= nil then
+    if now() - hotAt &lt; ABF.HOT_COOLDOWN_MS then
+      return false  -- адрес недавно показал себя горячим — ждём cooldown
+    end
+    ABF.hotAddrs[addr] = nil  -- cooldown истёк — второй шанс
+  end
+  local w = ABF.watches[addr]
+  if w ~= nil then
+    if branch ~= nil then w.branches[branch] = true end
+    return true
+  end
+  if ABF.watchCount &gt;= ABF.MAX_WATCH then
+    -- v1.89: СПЕКУЛЯТИВНЫЕ ветки (field-лестницы) не вытесняют никого —
+    -- ждут очереди. Раньше depth-эвикция пропускала их («глубже = ценнее»),
+    -- и лестница выталкивала держателей holder-ветки (лог 174503:
+    -- removed holder 181B3263478 — держатель 6-держательной ветки).
+    if branch ~= nil and branch.spec then
+      return false
+    end
+    -- вытеснение по ценности: первыми жертвуем watchpoints без единого
+    -- полезного хита, подтверждённые (давшие уровни) — в последнюю очередь
+    -- v1.68: жертва — СТАРЫЙ ноль-хит (мусор от старых поколений GC). Только
+    -- что вооружённый watch (&lt;2 с) защищён: раньше эвикция всегда била по
+    -- свежему self-watch нового уровня (единственный ноль-хит в момент
+    -- постановки) и убивала подъём (лог 23:34/23:38).
+    -- v1.70: жертва СВОЕЙ ветки — в последний момент: выкидывая держателей
+    -- той же цепочки, по которой только что поднялись, отрезали себе путь
+    -- наверх (Hades: уровень 3-4 умирал, потому что эвикция снимала его же
+    -- родителей уровня 1-2).
+    -- v1.72: эвикция УЧИТЫВАЕТ ГЛУБИНУ. Копирующий писец Hades приносит
+    -- новый объект-источник на каждый тик: каждая shallow-ветка (глубина 1)
+    -- требовала слоты и выталкивала держателей ГЛУБОКОЙ ветки через секунду
+    -- после постановки (лог 161531: уровень 4 достигнут, но все его watch
+    -- сняты «budget exhausted» за 1-2 с — до первого хита). Правило: жертвуем
+    -- самый МЕЛКИЙ ноль-хитовый watch; если мелоче глубже входящего — слот
+    -- не даём вовсе (входящий shallow-объект подождёт в watchAddrs ветки).
+    local incDepth = (branch ~= nil and #(branch.offsets or {}) or 0)
+    local victim, victimDepth = nil, nil
+    local tnow = now()
+    for _, old in ipairs(ABF.watchOrder) do
+      local ow = ABF.watches[old]
+      if ow ~= nil and ow.kind ~= 'write'
+          and ow.hits == 0 and tnow - (ow.t0 or 0) &gt; 2000 then
+        local sameBr = branch ~= nil and ow.branches[branch] ~= nil
+        if not sameBr then
+          local d = 99
+          for br in pairs(ow.branches) do
+            local bd = #(br.offsets or {})
+            if bd &lt; d then d = bd end
+          end
+          if victim == nil or d &lt; victimDepth then
+            victim, victimDepth = old, d
+          end
+        end
+      end
+    end
+    if victim ~= nil and victimDepth &gt; incDepth + 1 then
+      -- единственные кандидаты на вытеснение глубже входящего: не отнимаем
+      -- слот у продвижения ради shallow-объекта-копии
+      victim = nil
+    end
+    if victim == nil then
+      -- v1.72: свободного слота нет — НЕ ставим (watchCount+1)-й брейкпоинт:
+      -- CE при переполнении DR деградирует в page-метод и устраивает шторм
+      return false
+    end
+    if victim ~= nil then
+      -- v1.57: вытесненного watch надо убирать из watchAddrs, иначе бурст
+      -- переармирует его каждые 5 с (цикл пожирания бюджета).
+      -- v1.75: но ВЫЧЁРКИВАТЬ ВСЕХ жертв было слишком: держателей уровня 5 в
+      -- Absolum вытолкнули до первого хита, вычеркнули из очереди — и самая
+      -- глубокая ветка навсегда осталась без перевооружения (бурсты до конца
+      -- прогона вооружали что-то одно). Теперь вычёркиваем только
+      -- БЕСПЛОДНЫХ (хиты были — результата нет); вытесненные без единого
+      -- хита остаются в очереди — бурст вернёт их при свободном слоте.
+      local victimHadHits = ABF.watches[victim] ~= nil
+        and ABF.watches[victim].hits &gt; 0
+      if victimHadHits then
+        for _, br2 in ipairs(ABF.branches) do
+          local keep = {}
+          for _, wa in ipairs(br2.watchAddrs or {}) do
+            if wa ~= victim then keep[#keep + 1] = wa end
+          end
+          br2.watchAddrs = keep
+        end
+      end
+      removeWatch(victim)
+      log(fmt('[-] watchpoint budget exhausted: removed holder %X%s',
+        victim, victimHadHits and '' or ' (queued for re-arm)'))
+    end
+  end
+  -- ТОЛЬКО debug-регистры (bpmDebugRegister). Page-метод (bpmException) на
+  -- горячих адресах устраивает шторм исключений и роняет игру. 4 DR-слота:
+  -- корневой + до 3 держателей, лишние вытесняются по LRU.
+  local trig = trigger or ((kind == 'write') and bptWrite or bptAccess)
+  -- v1.96: замыкание на адрес — CE 7.7 вызывает callback БЕЗ аргументов
+  -- (проверено: n=0), поэтому адрес сработавшего watch иначе неизвестен.
+  -- Точная атрибуция без декодирования: счётчики/жнец/пауза/ротация видят
+  -- жизнь ячеек, которые игра читает «недекодируемыми» инструкциями.
+  local myAddr = addr
+  local ok = pcall(debug_setBreakpoint, addr, size, trig, bpmDebugRegister,
+    function(...) bpCallback(myAddr) end)
+  if not ok then
+    log(fmt('[!] failed to set a breakpoint at %X', addr))
+    return false
+  end
+  w = { kind=kind, size=size, trig=trig, branches={}, hits=0, fails=0,
+        t0=now(), rateN=0, rateT0=now() }
+  if branch ~= nil then w.branches[branch] = true end
+  ABF.watches[addr] = w
+  insert(ABF.watchOrder, addr)
+  ABF.watchCount = ABF.watchCount + 1
+  if kind ~= 'write' then
+    -- открыли бирст-окно: через BURST_MS access-watch снимутся до паузы
+    ABF.burstEnds = now() + ABF.BURST_MS
+  end
+  return true
+end
+
+-- v1.98: снятие брейкпоинта в CE 7.7. Эксперимент на живом CE: одноаргументный
+-- debug_removeBreakpoint — ЗАГЛУШКА (pcall=true, список не меняется, призраки
+-- копятся на 52+ и душат подачу хитов). Рабочая форма — 3-арг с точным
+-- совпадением size+trigger из постановки.
+local function removeBreakpointHard(addr, size, trig)
+  -- v1.98: 3-арг снимает DR-served bps; page-served брошенные guard'ы снятие
+  -- записи не отцепляет (ловушки шли после «watches(0)») — добиваем byID.
+  local ok = pcall(debug_removeBreakpoint, addr, size, trig)
+  if not ok then ok = pcall(debug_removeBreakpoint, addr) end
+  pcall(debug_removeBreakpointByID, addr)
+  return ok
+end
+
+removeWatch = function(addr)
+  local w = ABF.watches[addr]
+  if w ~= nil then
+    removeBreakpointHard(addr, w.size or 8, w.trig or bptAccess)
+    ABF.watches[addr] = nil
+    ABF.watchCount = ABF.watchCount - 1
+  end
+end
+
+-- снять НАВСЕГДА: адрес в чёрный список — переармливание не воскресит
+-- (само-ссылки, горячие и бесплодные адреса иначе воскресали циклически)
+local function retireWatch(addr, reason)
+  ABF.hotAddrs[addr] = now()
+  removeWatch(addr)
+  if reason ~= nil then
+    log(fmt('[-] %s — removed and blacklisted', reason))
+  end
+end
+
+local function removeAllWatches()
+  for addr in pairs(ABF.watches) do
+    pcall(debug_removeBreakpoint, addr)
+  end
+  ABF.watches = {}
+  ABF.watchOrder = {}
+  ABF.watchCount = 0
+end
+
+--------------------------------------------------------- writable-карта памяти
+local function buildWritableMap()
+  local list = {}
+  local ok, regions = pcall(enumMemoryRegions)
+  if ok and type(regions) == 'table' then
+    for _, r in ipairs(regions) do
+      if r.State == 0x1000 then  -- MEM_COMMIT
+        local p = r.Protect
+        if p == 0x04 or p == 0x08 or p == 0x40 or p == 0x80 then
+          local a = r.BaseAddress
+          insert(list, { a = a, b = a + r.RegionSize })
+        end
+      end
+    end
+    table.sort(list, function(x, y) return x.a &lt; y.a end)
+  end
+  ABF.writable = list
+end
+
+local function isWritable(addr)
+  local lo, hi = 1, #ABF.writable
+  while lo &lt;= hi do
+    local mid = (lo + hi) // 2
+    local e = ABF.writable[mid]
+    if addr &lt; e.a then hi = mid - 1
+    elseif addr &gt;= e.b then lo = mid + 1
+    else return true end
+  end
+  return false
+end
+
+------------------------------------------------------------- ветки и сканирование
+ABF.branches  = {}
+ABF.branchSeq = 0
+
+local function newBranch(obj, offsets)
+  ABF.branchSeq = ABF.branchSeq + 1
+  local br = {
+    obj = obj,
+    offsets = offsets,
+    lastHit = now(),
+    id = ABF.branchSeq,
+    watchAddrs = {},  -- какие адреса эта ветка сторожит (для бирстов)
+    done = false,     -- ветка уже дала продвижение вверх
+  }
+  insert(ABF.branches, br)
+  return br
+end
+
+local function scanHolders(objAddr)
+  local pat = {}
+  for i = 0, 7 do
+    insert(pat, fmt('%02X', (objAddr &gt;&gt; (8 * i)) &amp; 0xFF))
+  end
+  local pattern = table.concat(pat, ' ')
+  local out = {}
+  local ok, sl = pcall(AOBScan, pattern, '+W-C', 1, '8')
+  if not ok then
+    log('[!] AOBScan error: ' .. tostring(sl))
+    -- запасной вариант: без ограничения на copy-on-write
+    ok, sl = pcall(AOBScan, pattern, '+W', 1, '8')
+    if not ok then
+      log('[!] AOBScan retry error: ' .. tostring(sl))
+      return out
+    end
+  end
+  if ok and sl ~= nil then
+    for i = 0, sl.Count - 1 do
+      local a = tonumber(sl[i], 16)
+      if a ~= nil and a ~= objAddr then insert(out, a) end
+    end
+    pcall(object_destroy, sl)
+  end
+  return out
+end
+
+-- v2.00 SCAN-WALK: найти узел-родителя для интерьерного держателя H.
+-- H = P + disp (P — узел, disp — офсет поля). Владелец узла P — ячейка Q,
+-- в которой лежит &amp;P. Ищем одним AOBScan'ом все 8-байтные значения, чьи
+-- байты 3-5 совпадают с байтами 3-5 адреса H (окно ±16 МБ, старшие байты
+-- канонического указателя = 00), читаем каждое и фильтруем 0 &lt;= H-V &lt;= 0x1000.
+-- Возвращает список { { P, disp }, ... }, отсортированный по disp (меньший
+-- офсет вероятнее — начало структуры).
+local function scanNearPointer(H)
+  local out = {}
+  local b = {}
+  for i = 0, 7 do
+    b[i] = (H &gt;&gt; (8 * i)) &amp; 0xFF
+  end
+  local pattern = fmt('?? ?? ?? %02X %02X %02X 00 00', b[3], b[4], b[5])
+  local ok, sl = pcall(AOBScan, pattern, '+W-C', 1, '8')
+  if not ok then
+    ok, sl = pcall(AOBScan, pattern, '+W', 1, '8')
+    if not ok then
+      log('[!] scan-walk AOBScan error: ' .. tostring(sl))
+      return out
+    end
+  end
+  if ok and sl ~= nil then
+    for i = 0, sl.Count - 1 do
+      local q = tonumber(sl[i], 16)
+      if q ~= nil and q ~= H then
+        local okv, v = pcall(readQword, q)
+        if okv and v ~= nil and v &gt; 0x10000 and v &lt; 0x00007FFFFFFFFFFF then
+          local disp = H - v
+          if disp &gt;= 0 and disp &lt;= 0x1000 then
+            out[#out + 1] = { v, disp, q }
+          end
+        end
+      end
+    end
+    pcall(object_destroy, sl)
+  end
+  table.sort(out, function(x, y) return x[2] &lt; y[2] end)
+  return out
+end
+
+local function validateObj(obj, ctx)
+  if obj == nil or obj &lt; 0x10000 then return false, 'zero/garbage address' end
+  if obj &gt; 0x00007FFFFFFFFFFF then return false, 'not a canonical address' end
+  if ctx ~= nil and ctx.RSP ~= nil and math.abs(obj - ctx.RSP) &lt; 0x100000 then
+    return false, 'looks like stack'
+  end
+  local ok, v = pcall(readQword, obj)
+  if not ok or v == nil then return false, 'not readable' end
+  return true, nil
+end
+
+--------------------------------------------------------------- чтение значения
+local VAL_SIZES = { Byte=1, ['2 Bytes']=2, ['4 Bytes']=4, ['8 Bytes']=8,
+                    Float=4, Double=8 }  -- Custom = ABF.customSize (1..8)
+
+local function valSize(typeName)
+  return VAL_SIZES[typeName] or ABF.customSize or 8
+end
+
+local function readTyped(addr, typeName)
+  if typeName == 'Double'   then return readDouble(addr) end
+  if typeName == 'Float'    then return readFloat(addr) end
+  -- no signed flag here: readQword(addr, x) returns nothing in some CE 7.7 builds
+  if typeName == '8 Bytes'  then return readQword(addr) end
+  if typeName == '4 Bytes'  then return readInteger(addr, false) end
+  if typeName == '2 Bytes'  then return readSmallInteger(addr, false) end
+  if typeName == 'Byte'     then
+    local t = readBytes(addr, 1, false)
+    if type(t) == 'table' then return t[1] end
+    return t
+  end
+  if typeName == 'Custom' then
+    local n = ABF.customSize or 4
+    local t = readBytes(addr, n, false)
+    if type(t) ~= 'table' then return nil end
+    local v = 0
+    for i = n, 1, -1 do v = v * 256 + (t[i] or 0) end
+    return v
+  end
+  return nil
+end
+
+-- v1.60: поиск ЖИВЫХ копий текущего значения — ТОЛЬКО сбор кандидатов
+-- (AOBScan того же значения, стек отсеивается, запоминается значение
+-- каждой ячейки). Живость проверяется ОТДЕЛЬНО в вотчдоге: через тик
+-- денег живая ячейка ИЗМЕНИТ значение, мёртвая — нет. Это убирает гонку
+-- «прочитали значение → тик денег → скан нашёл только освобождённые
+-- ячейки со старым значением». Возвращает число собранных кандидатов.
+local function collectLiveCandidates()
+  local okV, val = pcall(readTyped, ABF.rootAddr, ABF.typeName)
+  local n = 0
+  if not okV or val == nil then return 0 end
+  local bytes = {}
+  local tn = ABF.typeName
+  if tn == 'Double' then
+    local d = string.pack('&lt;d', val)
+    for i = 1, 8 do bytes[i] = fmt('%02X', d:byte(i)) end
+  elseif tn == 'Float' then
+    local d = string.pack('&lt;f', val)
+    for i = 1, 4 do bytes[i] = fmt('%02X', d:byte(i)) end
+  elseif tn == 'Byte' then
+    bytes[1] = fmt('%02X', math.floor(val) &amp; 0xFF)
+  elseif tn == '2 Bytes' then
+    local v = math.floor(val) &amp; 0xFFFF
+    bytes[1] = fmt('%02X', v &amp; 0xFF)
+    bytes[2] = fmt('%02X', (v &gt;&gt; 8) &amp; 0xFF)
+  elseif tn == '4 Bytes' then
+    local v = math.floor(val) &amp; 0xFFFFFFFF
+    for i = 0, 3 do bytes[#bytes + 1] = fmt('%02X', (v &gt;&gt; (8 * i)) &amp; 0xFF) end
+  elseif tn == '8 Bytes' then
+    local v = math.floor(val) &amp; 0xFFFFFFFFFFFFFFFF
+    for i = 0, 7 do bytes[#bytes + 1] = fmt('%02X', (v &gt;&gt; (8 * i)) &amp; 0xFF) end
+  else -- Custom: first N little-endian bytes
+    local sz = math.min(ABF.customSize or 4, 8)
+    local v = math.floor(val) &amp; 0xFFFFFFFFFFFFFFFF
+    for i = 0, sz - 1 do bytes[#bytes + 1] = fmt('%02X', (v &gt;&gt; (8 * i)) &amp; 0xFF) end
+  end
+  if #bytes == 0 then return 0 end
+  local okS, sl = pcall(AOBScan, table.concat(bytes, ' '), '+W-C', 1, '8')
+  if not okS or sl == nil then return 0 end
+  ABF.pendingCands = {}
+  for i = 0, sl.Count - 1 do
+    local a = tonumber(sl[i], 16)
+    if a ~= nil and a ~= ABF.rootAddr and not isStackish(a) then
+      local okc, cval = pcall(readTyped, a, ABF.typeName)
+      ABF.pendingCands[#ABF.pendingCands + 1] =
+        { addr = a, val0 = (okc and cval) or nil }
+      n = n + 1
+      -- v1.62: в большой игре «денежное» значение может совпасть в тысячах
+      -- ячеек — проверка живости и так отсеет, но читать их все дорого
+      if n &gt;= 200 then
+        log('[i] more than 200 candidates — trimming the list (the liveness check will filter).')
+        break
+      end
+    end
+  end
+  pcall(object_destroy, sl)
+  if n &gt; 0 then
+    ABF.pendingT0 = now()
+  ABF.pendingExt = 0
+    -- v1.71: значение датчика на момент сбора — материм кандидатов только
+    -- ПОСЛЕ следующего изменения датчика (в Hades значение меняется раз в
+    -- 30-60 с; старое окно 2.5 с выбрасывало живое хранилище как «мёртвое»)
+    ABF.pendingSensorVal = val
+  else
+    ABF.pendingCands = nil     -- пустой список не должен запускать maturation
+  end
+  return n
+end
+
+-- v1.60/v1.64: проверка накопленных кандидатов «изменилось ли значение за
+-- тик» и вооружение ЖИВЫХ write-watchpoints. Кандидаты — ЯЧЕЙКИ ЗНАЧЕНИЯ
+-- (нашли их AOB-сканом по значению), их путь — уровень 0: писец через
+-- handleWriteHit → подъём. v1.59-v1.62 вооружали их access: handleAccessHit
+-- требует branch, безветочный watch ловил 5 хитов-фейлов и уходил в чёрный
+-- список (лог 2026-10-10_095225: 9 минут пинг-понга «вооружили → 5 хитов →
+-- снят → тишина → самовосстановление», 100+ хитов, ноль подъёмов). Read-хиты
+-- ячейки значения бесполезны и так: самочтение — сентинель.
+-- Вызывается из вотчдога (вне контекста отладчика, игра не замораживается).
+local function armPendingLiveCandidates(maxArmed)
+  if ABF.pendingCands == nil then return 0, 0, 0 end
+  local armed, aliveN, deadN = 0, 0, 0
+  local alive = {}
+  for _, c in ipairs(ABF.pendingCands) do
+    local okv2, v2 = pcall(readTyped, c.addr, ABF.typeName)
+    local changed = okv2 and v2 ~= nil and c.val0 ~= nil
+      and math.abs(v2 - c.val0) &gt;= 0.5
+    if changed then
+      aliveN = aliveN + 1
+      alive[#alive + 1] = c.addr
+    else
+      deadN = deadN + 1
+    end
+  end
+  ABF.pendingCands = nil
+  for _, ad in ipairs(alive) do
+    if armed &lt; maxArmed then
+      if addWatch(ad, 'write', valSize(ABF.typeName), nil, nil) then
+        armed = armed + 1
+        log(fmt('[i] live candidate %X — watchpoint (write, level-0 path) set', ad))
+      end
+    end
+  end
+  log(fmt('[i] candidate check: %d live, %d dead, %d armed',
+    aliveN, deadN, armed))
+  return armed, aliveN, deadN
+end
+
+------------------------------------------------- обработка пути: climb / finish
+local climb   -- forward declaration
+local finish  -- forward declaration
+
+local stopAll  -- forward declaration
+
+-- v1.62: РЕЖИМ СВЕЖЕГО СКАНА. Гонка «прочитали значение → тик денег → скан
+-- по устаревшему шаблону» всегда даёт ноль кандидатов: живые ячейки уже
+-- уехали, шаблон никого не ловит. Лечится сканом СРАЗУ ПОСЛЕ изменения
+-- значения: введённый адрес остаётся датчиком (даже если сам лежит на
+-- стеке и лишь копирует значение), и в момент смены значения мы немедленно
+-- сканируем память по НОВОМУ шаблону — он гарантированно свежий (опрос
+-- каждые ~300 мс, тик обычно раз в секунду и реже).
+local function startResync(reason)
+  local okv, v = pcall(readTyped, ABF.rootAddr, ABF.typeName)
+  ABF.resync = {
+    lastVal = (okv and v) or nil,
+    startedAt = now(),
+    nextAt = 0,
+    attempts = 0,
+    unreadable = 0,
+    warnedIdle = false,
+  }
+  if okv and v ~= nil then ABF.lastResyncVal = v end -- v1.65: запасное ожидание для finish
+  log('[i] ' .. reason)
+  log('[i] fresh-scan mode: watching the address and will scan memory RIGHT ' ..
+    'AFTER the next value change — nothing needs to be done manually.')
+  setStatus('Fresh-scan mode: waiting for a value change (I will scan myself)')
+end
+
+local function resyncPollTick()
+  local r = ABF.resync
+  if r == nil then return end
+  local okv, v = pcall(readTyped, ABF.rootAddr, ABF.typeName)
+  if not okv or v == nil then
+    r.unreadable = r.unreadable + 1
+    if r.unreadable &gt;= 20 then -- ~6 с подряд нечитаемо — адрес мёртв
+      log('[!] the entered address is no longer readable — it is dead. Do a fresh ' ..
+        'scan in CE and enter a new address (best right after a value change).')
+      stopAll(false)
+    end
+    return
+  end
+  r.unreadable = 0
+  if r.lastVal == nil then r.lastVal = v return end
+  if r.lastVal == v or (type(v) == 'number' and type(r.lastVal) == 'number'
+      and math.abs(v - r.lastVal) &lt; 0.5) then
+    local idleMs = now() - r.startedAt
+    if idleMs &gt; 30000 and not r.warnedIdle then
+      r.warnedIdle = true
+      log('[i] value has not changed for 30+ s — trigger a change in the game ' ..
+        '(shoot/buy/take damage), I will rescan myself the moment it changes.')
+    end
+    return
+  end
+  -- ЗНАЧЕНИЕ ИЗМЕНИЛОСЬ — сканирую немедленно по новому (свежему) шаблону
+  r.attempts = r.attempts + 1
+  local oldVal = r.lastVal
+  r.lastVal = v
+  ABF.lastResyncVal = v      -- v1.65: запасное ожидание для finish
+  if r.attempts &lt;= 3 then
+    log(fmt('[i] value changed (%s -&gt; %s) — scanning immediately (attempt %d)...',
+      tostring(oldVal), tostring(v), r.attempts))
+  end
+  local collected = collectLiveCandidates()
+  if collected &gt; 0 then
+    ABF.resync = nil
+    log(fmt('[=] fresh scan: collected %d candidates right after the value change — ' ..
+      'the watchdog will verify their liveness by the next tick and arm them automatically.', collected))
+    setStatus('Fresh candidates collected — checking liveness by the tick')
+  else
+    if r.attempts &gt;= 12 then
+      log('[!] 12 fresh scans in a row found no copy — memory holds no ' ..
+        'long-lived copy of this value (or wrong type). Check the value type in CE.')
+      stopAll(false)
+    elseif r.attempts &lt;= 3 or r.attempts % 5 == 0 then
+      log(fmt('[i] fresh scan #%d: no copies found (the value moved on again) — waiting for the next change.', r.attempts))
+    end
+  end
+end
+
+-- v1.82: ЦЕПОЧКА-ВЫРАЖЕНИЕ для CE. Эмпирика на живом CE (2026-10-12):
+-- офсеты записи разыменовываются ВСЕ, включая последний, поэтому
+-- «финальный офсет поля БЕЗ deref» (Absolum: +760) офсетами невыразим —
+-- запись читала не ту ячейку и показывала «??». Зато адресное ВЫРАЖЕНИЕ
+-- с квадратными скобками работает как надо: каждая скобка = deref,
+-- хвостовой +N ВНЕ скобок = сдвиг без разыменования. Проверено:
+-- [[[[base]+10]+10]+10] → деньги; [...]+8 → соседнее поле.
+-- offs хранится глубина-первыми: offs[1] = финальный офсет поля (применяется
+-- ПОСЛЕДНИМ, без deref), offs[#offs] = якорный хоп (применяется первым).
+-- v1.92: запись офсетами через Lua-свойства (запасной путь, если table-мерж
+-- не сработал). Порядок офсетов — внутренний as-is (см. addPointerRecord).
+local function createOffsetsRecordLua(baseName, offs, typeName, descr)
+  pcall(function()
+    local ex = getAddressList().getMemoryRecordByDescription(descr)
+    if ex ~= nil then
+      pcall(function() ex.destroy() end)
+    end
+  end)
+  local mrNew = nil
+  pcall(function()
+    local mr = getAddressList().createMemoryRecord()
+    mr.Description = descr
+    mr.Type = ({ Double=(vtDouble or 6), Float=(vtSingle or 5),
+                 ['8 Bytes']=(vtQword or 4), ['4 Bytes']=(vtDword or 3),
+                 ['2 Bytes']=(vtWord or 2), Byte=(vtByte or 1),
+                 Custom=(vtCustom or 7) })[typeName]
+    if typeName == 'Custom' then mr.Size = ABF.customSize or 4 end
+    mr.Address = baseName
+    mr.OffsetCount = #offs
+    for i = 1, #offs do
+      mr.Offset[i - 1] = offs[i] &amp; 0xFFFFFFFFFFFFFFFF
+    end
+    mrNew = mr
+    -- v2.07: пинок перерисовки строки (см. addPointerRecord)
+    pcall(function() mr.Description = mr.Description end)
+  end)
+  return mrNew
+end
+
+local function selfVerifyRecord(mr, label)
+  -- v1.51: ПОЛНАЯ самопроверка записи в лог: что реально сохранено, и что
+  -- получится, если применить офсеты так, как это делает CE (шаг за шагом).
+  -- v1.66: возвращает true, если запись реально резолвится (CE смог
+  -- вычислить адрес) — от этого зависит, нужна ли запасная запись.
+  if mr == nil then
+    log(fmt('[✓] selfcheck [%s]: record not created', label))
+    return false
+  end
+  local addrS, cnt = nil, nil
+  pcall(function() addrS = mr.Address; cnt = mr.OffsetCount end)
+  local offsN = {}
+  pcall(function()
+    for i = 0, (cnt or 0) - 1 do offsN[#offsN + 1] = mr.Offset[i] end
+  end)
+  log(fmt('[✓] selfcheck [%s]: Address=%s, OffsetCount=%s, offsets={%s}',
+    label, tostring(addrS), tostring(cnt), table.concat(offsN, ', ')))
+  -- v1.93: хвостовой нулевой офсет ломает CE-запись (база deref'ится
+  -- неявно; эксперименты M3/D) — предупредим, если запись сделана вручную
+  if cnt ~= nil and cnt &gt;= 2 and tonumber(offsN[cnt] or 1) == 0 then
+    log('[!] WARNING: the LAST offset is 0 — CE breaks on that (base is deref\'d '..
+      'implicitly). Remove the trailing 0 offset.')
+  end
+  local base = getAddressSafe(addrS or '')
+  if base == nil or base == 0 then
+    log(fmt('[✓] base "%s" does NOT resolve via getAddressSafe', tostring(addrS)))
+    return false
+  end
+  local a = base
+  local steps = {}
+  -- v1.93: ИСТИННАЯ семантика CE (все 10 экспериментов сходятся):
+  -- p = [base] (неявный deref базы при Count&gt;=2); затем Offset[1..Count-1]
+  -- ПО ПОРЯДКУ, каждый хоп с deref; в конце +Offset[0] (поле, без deref).
+  -- Offset[0]=поле офсет, Offset[1..]=хопы от базы наружу (= внутренний
+  -- порядок инструмента as-is, что и подтверждает рабочую ручную запись
+  -- пользователя {760,48,10,20,68}).
+  do
+    local cntN = cnt or 0
+    if cntN &gt;= 2 then
+      local okR, na = pcall(readPointer, base)
+      if okR and na ~= nil then a = na end
+    end
+    -- хопы Offset[1..cnt-1]: добавить + deref
+    for i = 2, cntN do
+      a = a + offsN[i]
+      local okR, na = pcall(readPointer, a)
+      if not okR or na == nil or na == 0 then
+        steps[#steps + 1] = fmt('step%d: [%X] UNREADABLE/0', i - 1, a)
+        break
+      end
+      steps[#steps + 1] = fmt('step%d: [%X]-&gt;%X', i - 1, a, na)
+      a = na
+    end
+    -- поле Offset[0]: финальное смещение БЕЗ deref
+    if #steps &gt; 0 and cntN &gt;= 2 then
+      a = a + offsN[1]
+      local okD, v = pcall(readTyped, a, ABF.typeName)
+      steps[#steps + 1] = fmt('final: %X -&gt; value=%s', a, tostring(v))
+    end
+    if cntN == 1 then
+      a = base + offsN[1]
+      local okD, v = pcall(readTyped, a, ABF.typeName)
+      steps[#steps + 1] = fmt('step1: %X -&gt; value=%s', a, tostring(v))
+    end
+  end
+  if #steps == 0 then
+    -- v1.82: запись-выражение (офсетов нет): getAddressSafe резолвит скобки
+    local okV, vv = pcall(readTyped, base, ABF.typeName)
+    log(fmt('[✓] evaluation: expression "%s" -&gt; %X, value=%s',
+      tostring(addrS), base, okV and tostring(vv) or '?'))
+  else
+    log('[✓] evaluation by record offsets: ' .. table.concat(steps, ' | '))
+  end
+  local okC, cur = pcall(function() return mr.getCurrentAddress() end)
+  local lineC = '[✓] record getCurrentAddress: ' ..
+    (okC and type(cur) == 'number' and hex(cur) or tostring(cur))
+  log(lineC)
+  -- v1.85: «живость» записи = getCurrentAddress ИЛИ резолв выражения через
+  -- getAddressSafe. CE вычисляет адрес записи ЛЕНИВО (при перерисовке GUI):
+  -- свежесозданная запись возвращает getCurrentAddress=0, из-за чего кнопка
+  -- Add ошибочно считала рабочую запись сломанной и пересоздавала её
+  -- (лог 162157: churn «does not resolve → raw fallback → re-added»)
+  local okRec = (okC and type(cur) == 'number' and cur &gt; 0x10000)
+    or (base ~= nil and base &gt; 0x10000)
+  -- дамп в файл: пользователю достаточно прислать этот файл целиком
+  local okF, errF = pcall(function()
+    local f = io.open(ABF.SELFCHECK_PATH, 'a')
+    if f == nil then return end
+    f:write('---- ' .. os.date('%Y-%m-%d %H:%M:%S') .. ' [' .. label .. '] pid=' ..
+      tostring(getOpenedProcessID()) .. '\n')
+    f:write('Address=' .. tostring(addrS) .. ' OffsetCount=' .. tostring(cnt) ..
+      ' offsets={' .. table.concat(offsN, ', ') .. '}\n')
+    f:write('forward: ' .. table.concat(steps, ' | ') .. '\n')
+    f:write(lineC .. '\n')
+    f:close()
+  end)
+  if not okF then
+    log('[!] failed to write selfcheck file: ' .. tostring(errF))
+  end
+  return okRec
+end
+
+local function addPointerRecord(baseName, offs, typeName, descr, objNum)
+  if #offs &lt;= 1 then
+    -- одноуровневый случай (значение в статической глобальной): обычная запись
+    -- без указателя — Pointer с офсетом 0 разыменовал бы базу зря (v1.37)
+    local a = baseName
+    if offs[1] ~= nil and offs[1] ~= 0 then a = a .. offStr(offs[1]) end
+    local ok1 = pcall(function()
+      local mr = getAddressList().createMemoryRecord()
+      mr.Description = descr; mr.Type = ({ Double=(vtDouble or 5),
+        Float=(vtSingle or 5), ['8 Bytes']=(vtQword or 4),
+        ['4 Bytes']=(vtDword or 3), ['2 Bytes']=(vtWord or 2),
+        Byte=(vtByte or 1), Custom=(vtCustom or 7) })[typeName]
+    if typeName == 'Custom' then mr.Size = ABF.customSize or 4 end
+    mr.Address = a
+    end)
+    if not ok1 then
+      pcall(function()
+        local mr = getAddressList().createMemoryRecord()
+        mr.setDescription(descr); mr.setAddress(a)
+      end)
+    end
+    return
+  end
+  -- v1.92: запись офсетами — ЭМПИРИКА на живом CE (эксперимент L2.marker):
+  -- CE применяет офсеты С КОНЦА XML (Offset[Count-1] — первый хоп от базы,
+  -- Offset[0] — финальный офсет поля БЕЗ deref), и БАЗА РАЗЫМЕНОВЫВАЕТСЯ
+  -- НЕЯВНО. Следствие: явный +0-якорный хоп (наш offs[#]==0) в офсетах
+  -- ЛОМАЕТ запись (эксперименты M3/D: «FAIL» даже через минуты) — он
+  -- дублирует неявный deref базы. Отрезаем хвостовые нули перед записью.
+  -- (Прежнее понимание «все офсеты deref вкл. последний» было неверным —
+  -- старые записи {0,10,10,10} работали лишь из-за симметрии.)
+  while #offs &gt; 1 and (offs[#offs] or 1) == 0 do
+    offs = { table.unpack(offs, 1, #offs - 1) }
+  end
+  pcall(function()
+    local al = getAddressList()
+    local ex = al.getMemoryRecordByDescription(descr)
+    if ex ~= nil then ex.destroy() end
+    -- v2.03/v2.04: если эта цепь уже была в таблице (WRONG? или (120s check)) —
+    -- оживляем её вместо добавления дубля (пользователь 2026-10-15: «задублировал»).
+    local path = descr
+      :gsub('^Pointer Finder %(WRONG?%): ', '')
+      :gsub('^Pointer Finder %(120s check%): ', '')
+      :gsub('^Pointer Finder: ', '')
+    for _, prevName in ipairs({ 'Pointer Finder (WRONG?): ', 'Pointer Finder (120s check): ' }) do
+      local prev = al.getMemoryRecordByDescription(prevName .. path)
+      if prev ~= nil then
+        prev.Description = descr
+        pcall(function() prev.Color = 0x000000 end)
+        log('[i] previous record for this chain revived (no duplicate added).')
+        break
+      end
+    end
+  end)
+  local path = (os.getenv('TEMP') or '.') .. '\\abf_merge.ct'
+  local offsXml = {}
+  for i = 1, #offs do
+    offsXml[#offsXml + 1] = fmt('&lt;Offset&gt;%X&lt;/Offset&gt;', offs[i] &amp; 0xFFFFFFFFFFFFFFFF)
+  end
+  local esc = tostring(descr):gsub('&amp;', '&amp;amp;'):gsub('&lt;', '&amp;lt;'):gsub('&gt;', '&amp;gt;')
+  local xml = table.concat({
+    '&lt;?xml version="1.0" encoding="utf-8"?&gt;',
+    '&lt;CheatTable CheatEngineTableVersion="38"&gt;',
+    '&lt;CheatEntries&gt;',
+    '  &lt;CheatEntry&gt;',
+    '    &lt;ID&gt;0&lt;/ID&gt;',
+    '    &lt;Description&gt;"' .. esc .. '"&lt;/Description&gt;',
+    '    &lt;VariableType&gt;' .. typeName .. '&lt;/VariableType&gt;',
+    typeName == 'Custom' and ('    &lt;CustomType&gt;' .. tostring(ABF.customSize or 4) .. '&lt;/CustomType&gt;') or '',
+    '    &lt;Address&gt;' .. baseName .. '&lt;/Address&gt;',
+    '    &lt;Offsets&gt;',
+    '      ' .. table.concat(offsXml, '\n      '),
+    '    &lt;/Offsets&gt;',
+    '  &lt;/CheatEntry&gt;',
+    '&lt;/CheatEntries&gt;',
+    '&lt;/CheatTable&gt;',
+  }, '\n')
+  local f = io.open(path, 'wb')
+  local merged = false
+  if f ~= nil then
+    f:write(xml)
+    f:close()
+    local okL, errL = pcall(loadTable, path, true)
+    merged = okL
+    if not okL then
+      -- v1.48: молчаливый провал мержа не давал понять, почему путь не работает
+      log('[!] loadTable(merge): ' .. tostring(errL))
+    end
+    pcall(os.remove, path)
+  else
+    log('[!] failed to write temp file ' .. path)
+  end
+  local mr = nil
+  pcall(function() mr = getAddressList().getMemoryRecordByDescription(descr) end)
+  local mrLua = nil
+  if merged and mr ~= nil then
+    log(fmt('[i] record [module] created via table merge: base "%s", offsets %d',
+      baseName, #offs))
+  else
+    -- запасной путь: Lua-свойства (в некоторых сессиях работает)
+    log('[!] table merge failed — creating via Lua properties')
+    mrLua = createOffsetsRecordLua(baseName, offs, typeName, descr)
+  end
+  -- v2.07: «пинок» перерисовки строки — программно созданные записи иногда
+  -- отрисовываются в списке с задержкой ~30 с (пользователь ждал у лога,
+  -- хотя запись уже была добавлена и резолвилась).
+  pcall(function()
+    if mr ~= nil then mr.Description = mr.Description end
+    if mrLua ~= nil then mrLua.Description = mrLua.Description end
+  end)
+  -- v2.08: выделить новую запись — список скроллится к ней, пользователь
+  -- сразу видит находку (иначе она «появляется» только при прокрутке/клике)
+  pcall(function()
+    local target = mr or mrLua
+    if target ~= nil then getAddressList().setSelectedRecord(target) end
+  end)
+  local modOk = selfVerifyRecord(mr or mrLua, 'module')
+  -- v1.66: почистить устаревшую запасную запись от прошлых прогонов (когда
+  -- они создавались всегда) — модульная работает, сырая после перезапуска
+  -- игры только врёт
+  pcall(function()
+    local ex2 = getAddressList().getMemoryRecordByDescription(
+      descr .. ' [raw address, until game restart]')
+    if ex2 ~= nil then
+      ex2.destroy()
+      log('[i] stale [raw address] record removed — the module record works.')
+    end
+  end)
+  -- v1.66: запасная запись на сыром адресе — ТОЛЬКО если модульная запись
+  -- не резолвится (getAddressSafe/getCurrentAddress не сработали в этом CE).
+  -- Она создавалась всегда как костыль эпохи «??»-записей; теперь модульная
+  -- работает, а сырая после перезапуска игры лишь врёт (абсолютный адрес
+  -- умер) и захламляет таблицу — одна рабочая запись удобнее двух.
+  if objNum ~= nil and objNum &gt; 0x10000 and not modOk then
+    log('[i] module record does not resolve — adding a raw-address fallback '..
+      '(valid until game restart)')
+    local descr2 = descr .. ' [raw address, until game restart]'
+    pcall(function()
+      local ex2 = getAddressList().getMemoryRecordByDescription(descr2)
+      if ex2 ~= nil then ex2.destroy() end
+    end)
+    local path2 = (os.getenv('TEMP') or '.') .. '\\abf_merge2.ct'
+    local offsXml2 = {}
+    for i = 1, #offs do
+      offsXml2[#offsXml2 + 1] = fmt('&lt;Offset&gt;%X&lt;/Offset&gt;', offs[i] &amp; 0xFFFFFFFFFFFFFFFF)
+    end
+    local esc2 = tostring(descr2):gsub('&amp;', '&amp;amp;'):gsub('&lt;', '&amp;lt;'):gsub('&gt;', '&amp;gt;')
+    local xml2 = table.concat({
+      '&lt;?xml version="1.0" encoding="utf-8"?&gt;',
+      '&lt;CheatTable CheatEngineTableVersion="38"&gt;',
+      '&lt;CheatEntries&gt;',
+      '  &lt;CheatEntry&gt;',
+      '    &lt;ID&gt;0&lt;/ID&gt;',
+      '    &lt;Description&gt;"' .. esc2 .. '"&lt;/Description&gt;',
+      '    &lt;VariableType&gt;' .. typeName .. '&lt;/VariableType&gt;',
+      '    &lt;Address&gt;' .. hex(objNum) .. '&lt;/Address&gt;',
+      '    &lt;Offsets&gt;',
+      '      ' .. table.concat(offsXml2, '\n      '),
+      '    &lt;/Offsets&gt;',
+      '  &lt;/CheatEntry&gt;',
+      '&lt;/CheatEntries&gt;',
+      '&lt;/CheatTable&gt;',
+    }, '\n')
+    local f2 = io.open(path2, 'wb')
+    local merged2 = false
+    if f2 ~= nil then
+      f2:write(xml2)
+      f2:close()
+      merged2 = pcall(loadTable, path2, true)
+      pcall(os.remove, path2)
+    end
+    local mr2 = nil
+    pcall(function() mr2 = getAddressList().getMemoryRecordByDescription(descr2) end)
+    local mr2b = nil
+    if merged2 and mr2 ~= nil then
+      log(fmt('[i] record [raw address] created via merge: base %X, offsets %d — '..
+        'shows the value right away; after a game restart run the search again',
+        objNum, #offs))
+    else
+      mr2b = createOffsetsRecordLua(hex(objNum), offs, typeName, descr2)
+      log(fmt('[i] record [raw address] (Lua): base %X, offsets %d', objNum, #offs))
+    end
+    selfVerifyRecord(mr2 or mr2b, 'raw address')
+  end
+end
+
+finish = function(state)
+  local obj  = state.obj
+  local offs = state.offsets
+
+  local baseName = hex(obj)
+  local ok, name = pcall(getNameFromAddress, obj, true, false)
+  if ok and type(name) == 'string' and name ~= '' then baseName = name end
+
+  -- человекочитаемый путь (внутренняя скобка применяется первой).
+  -- v2.05: якорный хоп +0 сразу после базы в тексте не пишем — CE читает
+  -- [base] ровно как [base+0], текст короче (пожелание пользователя).
+  -- Хвостовой +N (поле без deref) пишем всегда — он семантически обязателен.
+  local s = baseName
+  for i = #offs, 1, -1 do
+    if i == #offs and offs[i] == 0 then
+      s = fmt('[%s]', s)
+    else
+      s = fmt('[%s%s]', s, offStr(offs[i]))
+    end
+  end
+
+  -- v1.95: во время валидационного окна новые находки игнорируются — одна
+  -- цепь-кандидат за раз (иначе каждая копия добавит свою запись)
+  if ABF.validating ~= nil then
+    return false
+  end
+
+  -- v1.65: контрольное чтение ДО объявления находки. Ожидаемое значение —
+  -- ТЕКУЩЕЕ, с датчика (введённый адрес обновляется каждым тиком; стартовое
+  -- значение устаревает, пока идёт подъём). Допуск — пара тиков: рабочие
+  -- значения (деньги) меняются между чтениями, а ложные цепочки (константы
+  -- уровней, чужие поля) отличаются на порядки. Лог 102235: ложная ветка
+  -- из «кластера регистров» прочла 3333 (константа L2) вместо денег — и
+  -- объявлялась находкой 8 раз подряд.
+  local addr = obj
+  local chainOk = true
+  for i = #offs, 2, -1 do
+    local okr, v = pcall(readQword, addr + offs[i])
+    if not okr or v == nil then chainOk = false; break end
+    addr = v
+  end
+  local vaddr = chainOk and (addr + offs[1]) or nil
+  local val = nil
+  if chainOk then
+    local okv, rv = pcall(readTyped, vaddr, ABF.typeName)
+    if okv then val = rv end
+  end
+
+  local exp, expSrc = nil, 'none'
+  local okE, ev = pcall(readTyped, ABF.rootAddr, ABF.typeName)
+  if okE and ev ~= nil then
+    exp, expSrc = ev, 'sensor (the entered address)'
+  elseif ABF.lastResyncVal ~= nil then
+    exp, expSrc = ABF.lastResyncVal, 'last fresh scan'
+  elseif ABF.expected ~= nil then
+    exp, expSrc = ABF.expected, 'start value'
+  end
+
+  if exp ~= nil then
+    local tol = math.max(100, math.abs(exp) * 0.02)
+    -- ВАЖНО: vaddr == ABF.rootAddr — ЛЕГИТИМНО, если введённый адрес и есть
+    -- настоящее хранилище (цепочка честно ведёт в него, e2e testtarget).
+    -- Источник ложных цепочек — вырожденные reload-матчи (disp=0), они
+    -- отсечены в processHit; здесь доп. фильтр не нужен.
+    if not chainOk or type(val) ~= 'number' or math.abs(val - exp) &gt; tol then
+      if ABF.rejectedChains[s] ~= true then
+        ABF.rejectedChains[s] = true
+        log(fmt('[!] chain REJECTED: [%s] = %s, but the current value is %s ' ..
+          '(source: %s, tolerance %.0f). False branch closed, search continues.',
+          hex(vaddr or 0), tostring(val), tostring(exp), expSrc, tol))
+      end
+      toast('chain rejected — keep playing', 0x0000FF, 300)  -- красный, низкий тон
+      -- закрыть ветки-владельцы этого (ложного) держателя вместе с их
+      -- watchpoints — иначе каждый тик заново «находит» ту же ерунду
+      local w = ABF.watches[obj]
+      if w ~= nil then
+        local owners = {}
+        for br in pairs(w.branches) do br.done = true; owners[#owners + 1] = br end
+        local toRemove = {}
+        for a2, w2 in pairs(ABF.watches) do
+          local touched = false
+          for _, br in ipairs(owners) do
+            if w2.branches[br] then w2.branches[br] = nil; touched = true end
+          end
+          if touched and next(w2.branches) == nil then toRemove[#toRemove + 1] = a2 end
+        end
+        for _, a2 in ipairs(toRemove) do removeWatch(a2) end
+      end
+      return false
+    end
+    log(fmt('[✓] control read [%s] = %s matches the current value (%s)',
+      hex(vaddr), tostring(val), expSrc))
+  end
+
+  log('[★] BASE ADDRESS FOUND: ' .. s)
+  toast('★ BASE ADDRESS FOUND', 0x00FF00, 1200)  -- зелёный, высокий тон
+  pcall(function() beep(900, 90) end)
+  ABF.lastPath = { baseName=baseName, offsets=offs, typeName=ABF.typeName, str=s, obj=obj }
+  -- v2.04: запись создаётся с пометкой (120s check) — пользователь видит,
+  -- что она ещё на проверке, и не закрывает инструмент во время валидации.
+  addPointerRecord(baseName, offs, ABF.typeName, 'Pointer Finder (120s check): ' .. s, obj)
+  -- v1.95: ВАЛИДАЦИОННОЕ ОКНО — не финализируем сразу. Цепь, которая проходит
+  -- контроль в момент находки, может оказаться КОПИЕЙ в большом контейнере
+  -- (Absolum 010200: +68/+20/+D40 протухла при смене экрана, а 5-хоповая
+  -- выжила). Держим поиск живым 120 с: цепь перепроверяется против датчика
+  -- каждые 5 с (см. вотчдог). Пережила — финал; протухла — запись удаляется,
+  -- цепь в rejectedChains, поиск продолжается.
+  ABF.validating = { path = s, baseName = baseName, offs = offs,
+                     t0 = now(), lastOk = now() }
+  -- v2.10: храним сам объект записи — валидатор оценивает цепь СРЕДСТВАМИ CE
+  -- (getCurrentAddress записи). Наш собственный обход офсетов применял их не
+  -- в том порядке (без якорного хопа) — на цепях с ненулевым первым хопом
+  -- (Absolum +68) всегда давал мусор → ложные STALE; testtarget проходил
+  -- случайно (симметричные хопы + нулевой якорь).
+  pcall(function()
+    ABF.validating.mr = getAddressList().getMemoryRecordByDescription(
+      'Pointer Finder (120s check): ' .. s)
+  end)
+  -- v1.95.1: валидатор ходит по цепи как CE — хвостовой +0-якорный хоп
+  -- отрезать (иначе последний deref уходит в ячейку значения → мусор)
+  while #ABF.validating.offs &gt; 1 and ABF.validating.offs[#ABF.validating.offs] == 0 do
+    table.remove(ABF.validating.offs)
+  end
+  log('[+] record added — VALIDATING the chain for 120 s: keep playing, change screens!')
+  setStatus('Validating the found chain (120 s) — keep playing')
+end
+
+climb = function(state)
+  if not ABF.running then return false end
+  local obj = state.obj
+  local depth = #state.offsets
+
+  if depth &gt; ABF.MAX_DEPTH then
+    log(fmt('[-] branch trimmed: depth %d &gt; limit %d (object %X)', depth, ABF.MAX_DEPTH, obj))
+    return false
+  end
+  if #ABF.branches &gt;= ABF.MAX_BRANCHES then
+    -- ДАВЛЕНИЕ бюджета: закрываем самые старые мелкие ветки (не структурные
+    -- и не глубокие), пока не освободим половину. Сброс на каждом новом
+    -- мастере убивал climb при частом триггере — теперь чистка только здесь.
+    local victims, victimBranches = {}, {}
+    for i = 1, #ABF.branches do
+      if #ABF.branches - #victims &lt; ABF.MAX_BRANCHES / 2 then break end
+      local br = ABF.branches[i]
+      if not br.persistent and #br.offsets &lt; 2 then
+        insert(victims, i)
+        insert(victimBranches, br)
+      end
+    end
+    for _, br in ipairs(victimBranches) do
+      for addr, w in pairs(ABF.watches) do
+        if w.branches[br] then
+          w.branches[br] = nil
+          if next(w.branches) == nil then removeWatch(addr) end
+        end
+      end
+      log(fmt('[-] budget pressure: small branch %X closed', br.obj))
+    end
+    for j = #ABF.branches, 1, -1 do
+      for _, vb in ipairs(victimBranches) do
+        if vb == ABF.branches[j] then remove(ABF.branches, j); break end
+      end
+    end
+    if #victimBranches &gt; 0 then
+      ABF.branchLimitLogged = false
+      ABF.specGated = false
+    end
+  end
+  if #ABF.branches &gt;= ABF.MAX_BRANCHES then
+    -- даже после чистки мест нет — пропускаем новых кандидатов
+    if not ABF.branchLimitLogged then
+      ABF.branchLimitLogged = true
+      log('[!] branch limit reached — new candidates are skipped, search continues')
+    end
+    return false
+  end
+  if inModule(obj) then
+    finish(state)
+    return true
+  end
+  if ABF.processed[obj] then return false end
+  ABF.processed[obj] = true
+
+  local good, why = validateObj(obj, state.ctx)
+  if not good then
+    log(fmt('[-] candidate %X rejected: %s', obj, why or '?'))
+    return false
+  end
+  if not isWritable(obj) then
+    -- карта регионов устаревает (куча растёт, GC кладёт объекты в свежие
+    -- регионы) — перестраиваем и проверяем снова
+    local tb = now()
+    if tb - (ABF.lastMapBuild or 0) &gt; 5000 then
+      ABF.lastMapBuild = tb
+      buildWritableMap()
+    end
+    if not isWritable(obj) then
+      log(fmt('[-] candidate %X outside writable memory', obj))
+      return false
+    end
+  end
+
+  local holders = scanHolders(obj)
+  if #holders == 0 then
+    -- ВЛОЖЕННЫЙ объект: на него нет указателей в памяти (узел = родитель+off,
+    -- адрес вычисляется). Но адрес объекта — это одновременно и слот держателя,
+    -- поэтому читатель родительского поля (mov r12,[rbx+10]) ловится
+    -- access-watch'ем на САМ адрес объекта.
+    log(fmt('[~] no holders for %X (nested object) — placing an access-watch on the address itself', obj))
+    local br = newBranch(obj, state.offsets)
+    insert(br.watchAddrs, obj)
+    if not isStackish(obj) and addWatch(obj, 'access', 8, br) then
+      setStatus(fmt('Level %d: waiting for reads of object %X — a reader will reveal the parent',
+        depth, obj))
+      return true
+    end
+    log(fmt('[-] no pointers to %X found — branch dead end', obj))
+    return false
+  end
+
+  -- v2.00 SCAN-WALK: статический подъём БЕЗ read-ловушек. На машинах, где
+  -- access-ловушки не доставляются (VBS/антивирусы/особые конфигурации — как
+  -- на тестовой), watch-поток глохнет на глубине 3+. Примитив: держатель H —
+  -- интерьерная ячейка узла-родителя P (H = P + disp), значит в памяти есть
+  -- ячейка-владелец *Q = P. Ищем владельцев одним AOBScan по байтам 3-5 адреса
+  -- H (окно ±16МБ), фильтруем 0 &lt;= H-V &lt;= 0x1000 — получаем (P, disp), и
+  -- climb(P, offsets+[disp]) рекурсивно до модуля. Ложные кандидаты режет
+  -- финальная верификация (контрольное чтение + окно валидации).
+  local walkStarted = 0
+  local walkLogN = 0
+  -- v2.01: сначала ВСЕ держатели на inModule — это дёшево и это ФИНИШ.
+  -- (010403: модульный держатель стоял третьим, лимит 2 обрывал цикл до
+  -- проверки — золотая цепь не собиралась полчаса.)
+  for _, H in ipairs(holders) do
+    if inModule(H) then
+      local newOffs = {}
+      for i, o in ipairs(state.offsets) do newOffs[i] = o end
+      insert(newOffs, 0)
+      log(fmt('[+] scan-walk: holder %X of %X is a static module cell — assembling the chain', H, obj))
+      climb({ obj = H, offsets = newOffs, ctx = state.ctx })
+      walkStarted = walkStarted + 1
+    end
+  end
+  -- затем интерьерные родители (сканы), с бюджетом
+  for _, H in ipairs(holders) do
+    if inModule(H) then
+      -- уже обработан выше
+    elseif walkStarted &gt;= 3 then
+      break
+    else
+      local parents = scanNearPointer(H)
+      for _, cand in ipairs(parents) do
+        if walkStarted &gt;= 3 then break end
+        local P, disp = cand[1], cand[2]
+        -- v2.01: стековых «родителей» отсекаем до climb — они жгли бюджет
+        -- сканов (010403: +28/+38/+48/+58 — все кадры стека)
+        if isStackish(P) then
+          if walkLogN &lt;= 6 then
+            log(fmt('[-] scan-walk: parent %X of %X looks like stack — skipped', P, H))
+            walkLogN = walkLogN + 1
+          end
+        else
+          local newOffs = {}
+          for i, o in ipairs(state.offsets) do newOffs[i] = o end
+          insert(newOffs, disp)
+          walkLogN = walkLogN + 1
+          if walkLogN &lt;= 4 then
+            log(fmt('[+] scan-walk: %X is interior to %X (+%X) — climbing statically (level %d)',
+              H, P, disp, #newOffs))
+          end
+          climb({ obj = P, offsets = newOffs, ctx = state.ctx })
+          walkStarted = walkStarted + 1
+        end
+      end
+    end
+  end
+  if walkStarted &gt; 0 then
+    -- статический путь уже работает; watch-поток остаётся как ускоритель
+    -- (page-доставка на одностраничных кластерах), но от него больше ничего
+    -- не зависит.
+    log(fmt('[i] scan-walk: %d static parent candidate(s) launched from %d holder(s) of %X',
+      walkStarted, #holders, obj))
+  end
+
+  log(fmt('[+] level %d: object %X found in %d memory locations, setting access-watchpoints',
+    depth, obj, #holders))
+  if depth &gt; ABF.maxDepth then
+    ABF.maxDepth = depth
+    if ABF.lblDepth ~= nil then
+      ABF.lblDepth.Caption = fmt('Max depth: %d (object %X)', depth, obj)
+    end
+  end
+  toast(fmt('Depth %d — keep playing', depth), 0x00FFFF, 700)  -- жёлтый
+  local br = newBranch(obj, state.offsets)
+  br.holderHop = true  -- v1.84: у ветки есть ВООРУЖЁННЫЕ настоящие держатели —
+                       -- приоритет в перевооружении над спекулятивными ветками
+  br.spec = state.spec == true  -- v1.89: ветка field-лестницы (не вытесняет)
+  -- Self-watch ВСЕГДА (мастер живёт секунды: GC-сканы и установщики слотов
+  -- трогают его адрес и раскрывают вмещающие объекты), держатели — дополнением
+  insert(br.watchAddrs, obj)
+  local n = 0
+  if not isStackish(obj) and addWatch(obj, 'access', 8, br) then
+    n = 1
+  end
+  for _, h in ipairs(holders) do
+    if h ~= obj and not isStackish(h) then
+      -- v1.89: В ОЧЕРЕДЬ — ВСЕ держатели (раньше break на MAX_HOLDERS
+      -- отрезал остальных навсегда: лог 174503 — из 6 держателей ветки
+      -- наблюдались 3, игра читала другие). Вооружаем только первые
+      -- MAX_HOLDERS, круглый бурст-ротатор v1.88 доармит остальных.
+      insert(br.watchAddrs, h)
+      if n &lt; ABF.MAX_HOLDERS then
+        local okH = addWatch(h, 'access', 8, br)
+        if okH then n = n + 1 end
+      end
+    end
+  end
+  -- много держателей = несущая структура, не мимолётный узел: не закрывать
+  if #holders &gt;= 5 then
+    br.persistent = true
+    log(fmt('[i] object %X is a load-bearing structure (%d holders), branch will not time out',
+      obj, #holders))
+  end
+  setStatus(fmt('Level %d: play/trigger — waiting for accesses to holders of object %X',
+    depth, obj))
+  return n &gt; 0
+end
+
+------------------------------------------------------------- обработка хитов
+local function matchWatched(ins, ctx)
+  local results = {}
+  local ops = { ins.op1, ins.op2 }
+  for i, op in ipairs(ops) do
+    if op.kind == 'mem' then
+      local eff
+      if op.mem.hasRip then
+        -- статический операнд: CE печатает rip-rel уже разрешённым адресом
+        -- (absAddr), иначе считаем от конца инструкции
+        eff = op.mem.absAddr and op.mem.disp
+          or (ins.addr + (ins.len or 0) + op.mem.disp)
+      else
+        eff = effAddr(op.mem, ctx)
+      end
+      if eff ~= nil and ABF.watches[eff] ~= nil then
+        insert(results, { addr = eff, mem = op.mem, opi = i, static = op.mem.hasRip })
+      end
+    end
+  end
+  return results
+end
+
+-- Сигнал живого объекта: инструкция обращается через базовый регистр,
+-- значение которого совпадает с адресом наблюдения (±4 КБ — соседний объект
+-- на той же странице тоже годится). Возвращает true, если клаймб запущен.
+local function tryObjectBaseClimb(ins, ev, mem)
+  if ABF.objBaseTried then return false end
+  if mem == nil or mem.base == nil or mem.hasRip or mem.index ~= nil then
+    return false
+  end
+  local baseVal = regVal(ev.ctx, mem.base)
+  if baseVal == nil then
+    ABF.declineCount = (ABF.declineCount or 0) + 1
+    if ABF.declineCount &lt;= 3 then
+      log(fmt('[i] object-signal: register %s unavailable in context (%s)',
+        mem.base, ins.str))
+    end
+    return false
+  end
+  local diff = ABF.rootAddr - baseVal
+  if diff &gt; 0x1000 or diff &lt; -0x1000 then
+    ABF.declineCount = (ABF.declineCount or 0) + 1
+    if ABF.declineCount &lt;= 3 then
+      log(fmt('[i] object-signal rejected: %s=%X is too far from the watched address %X (%s)',
+        mem.base, baseVal, ABF.rootAddr, ins.str))
+    end
+    return false
+  end
+  ABF.objBaseTried = true  -- одна попытка на запуск
+  log(fmt('[~] "%s" accesses [%s+%X], base %X, our address %s (displacement %+d) —',
+    ins.str, mem.base, mem.disp, baseVal, hex(ABF.rootAddr), diff))
+  log('    it is a live object — scanning for pointers to it (level 1)')
+  if climb({ obj = baseVal, offsets = { diff }, ctx = ev.ctx }) then
+    return true
+  end
+  log('[!] no holders found or object rejected — keep waiting for a value write')
+  return false
+end
+
+-- Анализ регистров хита. Два вида кандидатов:
+--  1) регистр указывает на адрес наблюдения (±4 КБ) — наш адрес внутри объекта;
+--  2) ПАРА регистров (a, b): b = a + off, оба далеко от адреса наблюдения —
+--     это родитель и ВЛОЖЕННЫЙ узел (например rbx=..., r12=rbx+10): значение
+--     лежит в b+0, а на вложенные узлы указателей в памяти нет — поэтому
+--     клаймбаем на родителя a: цепочка «значение = (a+off)+0».
+local function tryRegisterClimb(ev)
+  -- спекулятивные кластеры — только при свободном бюджете: после армирования
+  -- структурных веток они превращаются в шум и вытесняют полезные watchpoints
+  if #ABF.branches &gt;= 12 then
+    if not ABF.specGated then
+      ABF.specGated = true
+      log('[i] speculative clusters disabled — the branch budget is used by structural ones')
+    end
+    return false
+  end
+  -- v1.38: кластеру нужно 2 DR-слота (self-watch + держатель); если свободен
+  -- только один — спекуляция вытеснит структурный держатель, запрещаем
+  if ABF.watchCount &gt;= ABF.MAX_WATCH - 1 then
+    return false
+  end
+  local vals = {}
+  for _, n in ipairs(CTX_REGS) do
+    if n ~= 'RSP' and n ~= 'RIP' then
+      local v = ev.ctx[n]
+      if v ~= nil and v &gt; 0x10000 and v &lt;= 0x00007FFFFFFFFFFF then
+        if ev.ctx.RSP == nil or math.abs(v - ev.ctx.RSP) &gt; 0x100000 then
+          vals[#vals + 1] = v
+        end
+      end
+    end
+  end
+  table.sort(vals)
+  -- уникализация с весами (сколько регистров держат значение)
+  local uniq = {}
+  local i = 1
+  while i &lt;= #vals do
+    local j = i
+    while j &lt; #vals and vals[j + 1] == vals[i] do j = j + 1 end
+    uniq[#uniq + 1] = { val = vals[i], weight = j - i + 1 }
+    i = j + 1
+  end
+
+  local cands = {}
+  for _, u in ipairs(uniq) do
+    local diff = ABF.rootAddr - u.val
+    if diff &gt;= -0x1000 and diff &lt;= 0x1000 then
+      cands[#cands + 1] = { obj = u.val, off = diff, prio = 0 }
+    end
+  end
+  -- v1.65: эвристика «вложенный кластер» (пара регистров a,b: b=a+off →
+  -- «родитель» a) ОТКЛЮЧЕНА. Она выдумывала родителей из случайных регистров
+  -- (лог 102235: узел = «родитель» − 0xF0), ложная ветка дотягивалась до
+  -- якоря и собирала правдоподобную, но НЕВЕРНУЮ цепочку (3333 вместо
+  -- денег) — та же болезнь, что у «регистр-родителя» из v1.56.
+
+  table.sort(cands, function(x, y)
+    if x.prio ~= y.prio then return x.prio &lt; y.prio end
+    return (x.weight or 0) &gt; (y.weight or 0)
+  end)
+
+  local attempts = 0
+  for _, c in ipairs(cands) do
+    local key = fmt('%X|%d', c.obj, c.off)
+    if ABF.triedRegBases[key] ~= true then
+      ABF.triedRegBases[key] = true
+      attempts = attempts + 1
+      if c.pageKey ~= nil then ABF.regionDone[c.pageKey] = true end
+      if c.prio == 0 then
+        log(fmt('[~] register points at the watched address: object %X, value %+d from it — looking for holders (level 1)',
+          c.obj, -c.off))
+      else
+        log(fmt('[~] register cluster: node %X = parent %X + %X (nested) — looking for PARENT holders (level 1)',
+          c.obj + c.off, c.obj, c.off))
+      end
+      -- значение = obj + off; для вложенного узла это (родитель+off)+0
+      climb({ obj = c.obj, offsets = { c.off }, ctx = ev.ctx })
+    end
+    if attempts &gt;= 3 then break end
+  end
+  return attempts &gt; 0
+end
+
+  local function handleWriteHit(ins, ev, m)
+  if not ABF.level0Armed then return end
+
+  local mem = m.mem
+  if mem.base == 'rsp' or mem.base == 'rbp' then
+    return  -- стек — не кандидат (повторы бесполезны, молча)
+  end
+
+  local written = (m.opi == 1) and (MEM_WRITE_MNEMS[ins.mnem] == true)
+  if not written then
+    tryObjectBaseClimb(ins, ev, mem)  -- чтение значения: пробуем регистровый сигнал
+    return
+  end
+
+  -- v1.81: контекст писца несёт регистры, указывающие на охватывающие
+  -- объекты (Absolum 164522: R14 = root-0x710 — единственный путь к
+  -- держателям, когда self-watch на родителе холодный). Раньше сигнал
+  -- по регистрам работал только для «промахнувшихся» хитов — ступор на
+  -- 3 минуты. tryRegisterClimb самодедупится и ограничен бюджетом.
+  tryRegisterClimb(ev)
+
+  if mem.hasRip then
+    -- статический писец (mov [0x...],xmm0 / mov qword [rip-подобный]): значение
+    -- живёт в глобальной переменной модуля — её адрес и есть якорь (v1.36)
+    local key = 'S' .. hex(m.addr)
+    if not ABF.directTried[key] then
+      ABF.directTried[key] = true
+      log(fmt('[+] level 0: static writer "%s" -&gt; anchor %X', ins.str, m.addr))
+      climb({ obj = m.addr, offsets = { 0 }, ctx = ev.ctx })
+    end
+    return
+  end
+
+  local src = (m.opi == 1) and ins.op2 or ins.op1
+
+  -- копия без оффсета: mov [base],reg — ищем, откуда взяли reg
+  if mem.disp == 0 and mem.index == nil and src.kind == 'reg' then
+    local preds = findPredecessors(ins.addr)
+    local track = canonReg(src.reg)
+    local foundMem = nil
+    for _, ci in ipairs(preds) do
+      local o1, o2 = ci.op1, ci.op2
+      if o1.kind == 'reg' and canonReg(o1.reg) == track then
+        if ci.mnem == 'lea' then
+          break  -- грузят адрес, а не значение — копии нет
+        elseif o2.kind == 'mem' and LOAD_MNEMS[ci.mnem] then
+          foundMem = o2.mem
+          break
+        elseif o2.kind == 'reg' and ci.mnem == 'mov' then
+          track = canonReg(o2.reg)  -- mov track,other — идём дальше назад
+        else
+          break  -- незнакомая запись в track (xor rax,rax и т.п.)
+        end
+      end
+    end
+
+    if foundMem ~= nil and foundMem.base ~= nil and not foundMem.hasRip then
+      local baseVal = regVal(ev.ctx, foundMem.base)
+      if baseVal ~= nil then
+        local srcAddr = baseVal + foundMem.disp
+        -- регистр-родитель источника (может меняться между хитами)
+        local parentCand = nil
+        for _, n in ipairs(CTX_REGS) do
+          if n ~= 'RSP' and n ~= 'RIP' then
+            local v = ev.ctx[n]
+            if v ~= nil and v &gt; 0x10000 and baseVal &gt; v and (baseVal - v) &lt;= 0x1000 then
+              if parentCand == nil or v &gt; parentCand then parentCand = v end
+            end
+          end
+        end
+        -- САМОЛЕЧЕНИЕ: корневой watch живёт до конца поиска. Каждое изменение
+        -- значения заново даёт свежие мастер/родителя; если ничего нового —
+        -- молчим (иначе спам на каждом тике денег).
+        -- v1.74: слепой дедуп «один слот» душил канонический источник: если
+        -- его ветка умерла (watch вытолкнут бюджетом, ветка закрыта), все
+        -- следующие тики молча пропускались вечно (лог 003152: после 00:32:17
+        -- ни одного copy-клайма за 4 минуты). Повтор пропускаем ТОЛЬКО пока
+        -- ветка источника жива; мёртвая ветка — переиск с cooldown 30 с.
+        if srcAddr == ABF.lastCopySource and parentCand == ABF.lastCopyParent then
+          local alive = false
+          for _, br2 in ipairs(ABF.branches) do
+            if not br2.done and br2.obj == srcAddr then alive = true; break end
+          end
+          if alive then
+            return
+          end
+          local lastTry = ABF.copyReclimbAt[srcAddr]
+          if lastTry ~= nil and now() - lastTry &lt; 30000 then
+            return
+          end
+          ABF.copyReclimbAt[srcAddr] = now()
+          ABF.lastCopySource = nil  -- прогнать заново через новый-source путь
+        end
+        local newSource = (srcAddr ~= ABF.lastCopySource)
+        ABF.lastCopySource = srcAddr
+        ABF.lastCopyParent = parentCand
+        if newSource then
+          log(fmt('[~] level 0: copy. Writer: %s', ins.str))
+          log(fmt('    data source: [%s] -&gt; address %X (base %X + offset %X)',
+            foundMem.str, srcAddr, baseVal, foundMem.disp))
+        end
+        climb({ obj = baseVal, offsets = { foundMem.disp }, ctx = ev.ctx })
+        -- v1.56: эвристика «регистр-родитель» (качала случайный регистр ниже
+        -- источника) ОТКЛЮЧЕНА — она строила ложные цепочки (+0x120, +0xC0),
+        -- которые и создавали «??»-записи. Настоящая цепочка находится через
+        -- holder-ячейки (access-watch на клетку, где лежит указатель).
+        return
+      end
+    end
+    if ABF.copyWalkFailRip ~= ins.addr then
+      ABF.copyWalkFailRip = ins.addr
+      log('[!] copy: could not find the source instruction — trying [base+0]')
+    end
+  end
+
+  -- прямой кандидат: объект = base, оффсет = disp
+  if mem.index ~= nil then
+    local iv = regVal(ev.ctx, mem.index)
+    if iv ~= nil and iv ~= 0 then
+      return  -- тихо
+    end
+  end
+  -- v1.99: декод-мусор «add [rax],al» (байты 00 00, walk-back по невыровненному
+  -- старту) от чужих page-guard'ов: 2-байтовый add не может быть писцом
+  -- многобайтовой валюты, а клайм от него заводил ветки в тупик (лог 223037:
+  -- 5 ложных level-1 подряд).
+  if ins.mnem == 'add' and (ins.len or 0) &lt;= 3 then
+    return
+  end
+  local baseVal = regVal(ev.ctx, mem.base or '')
+  if baseVal == nil then
+    return
+  end
+  local candKey = fmt('%X|%X', baseVal, mem.disp)
+  if ABF.directTried[candKey] then return end
+  ABF.directTried[candKey] = true
+  log(fmt('[+] level 0: writer "%s" -&gt; object %X, offset +%X', ins.str, baseVal, mem.disp))
+  local w0 = ABF.watches[ABF.rootAddr]
+  if w0 ~= nil then w0.lastDisc = now() end  -- v1.97: продуктивный сенсор не убивать
+  ABF.lastProgress = now()  -- v1.97
+  climb({ obj = baseVal, offsets = { mem.disp }, ctx = ev.ctx })
+end
+
+local function handleAccessHit(ins, ev, m, w)
+  -- v1.79: массовые копирования не раскрывают структуру — пропускаем
+  -- (иначе фантомные родители от memcpy забивают бюджет веток)
+  if BULK_MNEMS[ins.mnem] then return end
+  local brList = {}
+  for br in pairs(w.branches) do insert(brList, br) end
+  if #brList == 0 then
+    w.fails = w.fails + 1
+    if w.fails &gt;= 5 then
+      retireWatch(m.addr, fmt('holder %X yields no useful hits', m.addr))
+    end
+    return
+  end
+
+  local mem = m.mem
+  if mem.hasRip and m.static then
+    -- держатель — статическая ячейка (CE печатает rip-rel разрешённым адресом):
+    -- её адрес уже в модуле → цепочка готова. ВАЖНО (v1.37): офсет +0
+    -- ОБЯЗАТЕЛЕН в конце — иначе и finish, и CE-запись прочитают [ячейка+18]
+    -- вместо [ячейка+0]=Game (соседний мусор в .bss → «?????» в CE)
+    local processedAny = false
+    for br in pairs(w.branches) do
+      local newOffs = {}
+      for i, o in ipairs(br.offsets) do newOffs[i] = o end
+      insert(newOffs, 0)
+      if inModule(m.addr) then
+        log(fmt('[+] holder %X is a static module cell (depth %d) — assembling the chain',
+          m.addr, #newOffs + 1))
+      end
+      if climb({ obj = m.addr, offsets = newOffs, ctx = ev.ctx }) then
+        processedAny = true
+        w.lastDisc = now()  -- v1.97
+        ABF.lastProgress = now()  -- v1.97
+      end
+    end
+    if processedAny then
+      removeWatch(m.addr)
+    end
+    return
+  end
+  if mem.base == nil or mem.hasRip then
+    w.fails = w.fails + 1
+    if w.fails &gt;= 8 then retireWatch(m.addr) end
+    return
+  end
+  local baseVal = regVal(ev.ctx, mem.base)
+  if baseVal == nil then
+    w.fails = w.fails + 1
+    if w.fails &gt;= 8 then retireWatch(m.addr) end
+    return
+  end
+  if baseVal == m.addr then
+    -- «держатель» по адресу самого объекта (сентинел/само-ссылка) — шум
+    w.fails = w.fails + 1
+    if w.fails &gt;= 8 then
+      retireWatch(m.addr, fmt('holder %X — self-reference', m.addr))
+    end
+    return
+  end
+  -- VEH репортит контекст ПОСЛЕ инструкции: если она перезаписала свой же
+  -- базовый регистр (классика указатель-чейна: mov rax,[rax+18]), в базе
+  -- уже загруженное значение (наш узел), а не база. Восстанавливаем:
+  -- база = watch-адрес − смещение (v1.36)
+  local reloadHop = false
+  if m.mem.index == nil and ins.op1 ~= nil and ins.op1.kind == 'reg'
+      and canonReg(ins.op1.reg) == canonReg(m.mem.base)
+      and (LOAD_MNEMS[ins.mnem] or ins.mnem == 'lea') then
+    baseVal = m.addr - m.mem.disp
+    reloadHop = true  -- v1.83: структурный хоп (testtarget: mov rax,[rax+10])
+  end
+  -- дельта = полный смещающий компонент (disp + index*scale): работает и для
+  -- простых [base+disp], и для GC-сканов вида [base+idx*8], читающих поля
+  -- вложенных объектов по вычисляемому адресу
+  local delta = m.addr - baseVal
+
+  local processedAny = false
+  local meaningful = false  -- были ли не-самочтенные кандидаты
+  for _, br in ipairs(brList) do
+    if baseVal == br.obj then
+      -- самочтение: узел читают/пишут по его же адресу (значение/поля),
+      -- а не родительский слот — не штрафуем и не снимаем watch
+    else
+      local isDup = ABF.processed[baseVal] == true
+      if not isDup then meaningful = true end
+      local newOffs
+      if m.addr == br.obj then
+        -- SELF-WATCH: вложенный узел, слот родителя == адрес узла,
+        -- разыменования между родителем и узлом НЕТ → офсеты сливаются:
+        -- значение = родитель + delta + (первый офсет ветки)
+        -- v1.83: ДВА РОДА self-watch-хопов. RELOAD-хоп (mov reg,[reg+disp] —
+        -- перезагрузка базой; testtarget: вся цепочка так построена) —
+        -- структурный, ветка-родитель своё отработала (done). FIELD-хоп
+        -- (movss [rax+4],xmm — запись ПОЛЯ, база = obj−small) — спекулятивная
+        -- коррекция офсета поля: родителя НЕ закрываем и держим его ветку
+        -- живой (лог 155716: field-хоп в 16-держательной ветке пометил её
+        -- done — 2 минуты бурсты перевооружали бесплодную лестницу, а
+        -- настоящие держатели не получили ни одного слота).
+        if reloadHop then
+          ABF.embedRun = 0
+          newOffs = { delta + br.offsets[1] }
+          for i = 2, #br.offsets do newOffs[i] = br.offsets[i] end
+          log(fmt('[+] nested node %X lives at %X +%X (depth %d) — climbing higher',
+            br.obj, baseVal, newOffs[1], #newOffs))
+        else
+          ABF.embedRun = (ABF.embedRun or 0) + 1
+          if ABF.embedRun &gt; 2 then
+            log(fmt('[-] embedded ladder %X..%X too deep (no pointer holders on the way) — branch closed',
+              br.obj, baseVal))
+            w.branches[br] = nil
+            br.done = true
+            -- v1.87: если этот watch больше никому не служит — освободить
+            -- слот немедленно (лог 171722: осиротевшие watch держали DR-слоты
+            -- до конца поиска, держатели 17-держательной ветки голодали,
+            -- бурсты армили по 1 вместо 3)
+            if next(w.branches) == nil then
+              removeWatch(m.addr)
+            end
+          else
+            newOffs = { delta + br.offsets[1] }
+            for i = 2, #br.offsets do newOffs[i] = br.offsets[i] end
+            log(fmt('[+] nested node %X lives at %X +%X (depth %d, field) — climbing higher',
+              br.obj, baseVal, newOffs[1], #newOffs))
+            -- спекуляция: родителя не закрываем — см. v1.83 выше
+            -- v1.89: spec=true — ветка рождена field-лестницей (спекулятивная
+            -- коррекция офсета): ей запрещено вытеснять holder-ветки
+            if not isDup and climb({ obj = baseVal, offsets = newOffs,
+                ctx = ev.ctx, spec = true }) then
+              processedAny = true
+              w.lastDisc = now()  -- v1.97
+              ABF.lastProgress = now()  -- v1.97
+            end
+            newOffs = nil  -- общая обработка ниже не должна трогать родителя
+          end
+        end
+      else
+        -- обычный держатель: *(родитель + delta) == узел → офсет в конец цепочки
+        ABF.embedRun = 0  -- настоящий разыменованный хоп сбрасывает лестницу
+        newOffs = {}
+        for i, o in ipairs(br.offsets) do newOffs[i] = o end
+        insert(newOffs, delta)
+        log(fmt('[+] holder %X accessed via "%s" -&gt; parent %X, offset +%X (depth %d)',
+          m.addr, ins.str, baseVal, delta, #newOffs))
+      end
+      if newOffs ~= nil then
+        w.branches[br] = nil
+        br.done = true  -- ветка дала родителя — переармить её watch больше не нужно
+        if isDup then
+          -- родитель уже разбирали: повтор известной связи, а не мусор —
+          -- не штрафуем (реальные читатели этого держателя ещё придут)
+        elseif climb({ obj = baseVal, offsets = newOffs, ctx = ev.ctx }) then
+          processedAny = true
+          w.lastDisc = now()  -- v1.97
+          ABF.lastProgress = now()  -- v1.97
+        end
+      end
+    end
+  end
+
+  if processedAny then
+    removeWatch(m.addr)  -- держатель свою работу сделал
+    -- корневой watch ОСТАЁТСЯ: он источник свежих мастер/родителя при каждом
+    -- изменении значения (самолечение после GC/смены комнаты)
+  elseif not meaningful then
+    return  -- только самочтения/повторы — не штрафуем
+  else
+    w.fails = w.fails + 1
+    if w.fails &gt;= 8 then
+      -- без чёрного списка: адрес просто уходит из ротации и может вернуться
+      removeWatch(m.addr)
+      log(fmt('[-] holder %X no longer yields progress — removed', m.addr))
+    end
+  end
+end
+
+local function memOperandInfo(ins, ctx)
+  local parts = {}
+  local ops = { ins.op1, ins.op2 }
+  for _, op in ipairs(ops) do
+    if op.kind == 'mem' and op.mem.base ~= nil and not op.mem.hasRip then
+      local bv = regVal(ctx, op.mem.base)
+      parts[#parts + 1] = fmt('[%s+%X] base=%s', op.mem.base, op.mem.disp,
+        (bv ~= nil) and hex(bv) or '&lt;?&gt;')
+    end
+  end
+  if #parts == 0 then return '' end
+  return ' ' .. table.concat(parts, ' ')
+end
+
+local function processHit(ev)
+  -- мусорные контексты (RIP в невыделенной памяти — например, JIT/системные
+  -- исключения при конфликте DR) игнорируем полностью
+  if ev.rip == nil or ev.rip &lt; 0x10000 then return end
+  -- v1.50: СТЕКОВЫЙ КОРЕНЬ. Если введённый адрес лежит на стеке потока
+  -- (рядом с RSP), это мёртвая копия значения из скана — базового адреса у
+  -- неё не существует, а хиты будут вечным шумом из системного кода
+  if ABF.level0Armed and not ABF.stackRootWarned
+      and ABF.rootAddr ~= nil and ev.ctx ~= nil and ev.ctx.RSP ~= nil
+      and math.abs(ABF.rootAddr - ev.ctx.RSP) &lt; 0x100000 then
+    ABF.stackRootWarned = true
+    log(fmt('[!] WARNING: the entered address %s is on the STACK thread (RSP=%s). Even if it updates every second, it is a local copy in a stack frame — a stack cell never has a persistent pointer chain. Using it only as a change sensor — I will find the real storage of the value.',
+      hex(ABF.rootAddr), hex(ev.ctx.RSP)))
+    log('[i] looking for live copies of this value — collecting candidates; the watchdog will verify liveness by the money tick and arm them...')
+    ABF.branches = {}          -- чистый перезапуск: старые поколения — в утиль
+    removeAllWatches()
+    local collected = collectLiveCandidates()
+    if collected == 0 then
+      -- v1.62: не сдаёмся. Пустой скан почти всегда = тикальная гонка
+      -- (значение изменилось между чтением и AOBScan). Скан СРАЗУ после
+      -- следующего изменения найдёт и хранилище, и живые копии.
+      startResync('no copies with this value right now — the value has already changed '..
+        'since it was read (tick race).')
+    else
+      setStatus('Stack copy discarded — candidates collected, waiting for a money tick to check liveness')
+      log(fmt('[=] collected %d candidates — after the next money tick the live ones get watchpoints automatically.', collected))
+    end
+    return
+  end
+  local okRIP, bRIP = pcall(readBytes, ev.rip, 1)
+  if not okRIP or bRIP == nil then
+    ABF.strayHits = ABF.strayHits + 1
+    return
+  end
+
+  local ins = parseInstruction(ev.rip)
+  if ins == nil then
+    ABF.decodeFails = ABF.decodeFails + 1
+    if ABF.decodeFails &lt;= 5 then
+      log(fmt('[!] failed to decode instruction at %X', ev.rip))
+    end
+    if ABF.decodeFails &lt;= 2 then
+      local okd, raw = pcall(disassemble, ev.rip)
+      log('[i] raw disassembly: ' .. tostring(raw))
+    end
+  end
+
+  if ins ~= nil then
+    local matches = matchWatched(ins, ev.ctx)
+    -- v1.38: «затенение». Если инструкция на RIP совпала ТОЛЬКО сентинельно
+    -- (access-watch, база == watch — например, movsd xmm0,[rax] при
+    -- self-watch на Master), настоящий хит может быть в предшественнике:
+    -- mov rax,[rax+10] читает ДЕРЖАТЕЛЬ до перезаписи базы, и именно его DR
+    -- сработал. В этом случае тоже идём назад и отдаём приоритет держателю.
+    local shadowed = #matches &gt; 0
+    for _, m in ipairs(matches) do
+      local w = ABF.watches[m.addr]
+      local bv = (w ~= nil and w.kind == 'access' and m.mem.base ~= nil
+                  and not m.mem.hasRip) and regVal(ev.ctx, m.mem.base) or nil
+      if not (w ~= nil and w.kind == 'access' and bv == m.addr) then
+        shadowed = false
+        break
+      end
+    end
+    -- v1.68: предшественники и reload-матч считаются для КАЖДОГО хита.
+    -- Раньше блок выполнялся только при пустых совпадениях, и мусорный декод
+    -- («add [rax],al», совпавший с level-0 watch по случайному регистру)
+    -- занимал хит раньше reload-матча — держатель терялся недетерминированно
+    -- (лог 00:22: старт подъёма зависит от выравнивания регистров).
+    local preds, rbest, rbM = nil, nil, nil
+    if #ABF.queue &lt; ABF.QUEUE_MAX / 2 then
+      -- ВАЖНО: page-метод VEH репортит RIP = инструкция ПОСЛЕ настоящей:
+      -- CE снимает guard, делает single-step, и контекст уже на следующей
+      -- инструкции. Настоящий писец/читатель — среди предшественников.
+      preds = findPredecessors(ev.rip)
+    end
+    if preds ~= nil then
+      -- v1.65: RELOAD-МАТЧ — обход связного списка компилируется в
+      -- «mov rax,[rax+10]»: базовый регистр перезагружается самой
+      -- инструкцией, и в контексте ПОСЛЕ хита уже лежит загруженный узел,
+      -- поэтому эффективный адрес по контексту (узел+10) не попадает в
+      -- watch-ячейку держателя ([родитель+10]) — держатель терялся, и
+      -- подъём шёл только по записям GC. Проверка: если декод предка —
+      -- «mov reg,[reg+disp]», а значение reg в контексте равно СОДЕРЖИМОМУ
+      -- access-watch-ячейки, то эта инструкция грузила из неё, и база до
+      -- загрузки = watch − disp. Приоритет над walk-back: мусорные декоды
+      -- («add [rax],al» по сбитому выравниванию) иначе забивают хит.
+      local rbest, rbM = nil, nil
+      for _, p in ipairs(preds) do
+        local o1, o2 = p.op1, p.op2
+        if p.mnem == 'mov' and o1 ~= nil and o1.kind == 'reg'
+            and o2 ~= nil and o2.kind == 'mem' and o2.mem ~= nil
+            and not o2.mem.hasRip and o2.mem.index == nil
+            and o2.mem.disp ~= 0  -- v1.76: mov rax,[rax] (disp=0) — вырожденный
+            -- само-матч: parent = watch − 0 = сама ячейка (лог 012401: мусорная
+            -- цепочка с финальным +0 «через саму себя» прошла как находка)
+            and canonReg(o2.mem.base or '') == canonReg(o1.reg) then
+          local postVal = regVal(ev.ctx, o1.reg)
+          if postVal ~= nil and postVal &gt; 0x10000 then
+            for wa, w in pairs(ABF.watches) do
+              if w.kind == 'access' and next(w.branches) ~= nil then
+                local okr, content = pcall(readPointer, wa)
+                if okr and content ~= nil and content == postVal then
+                  if rbest == nil or (p.len or 0) &gt; (rbest.len or 0) then
+                    rbest = p
+                    rbM = { { addr = wa, opi = 2, mem = o2.mem,
+                              static = false, preBase = wa - o2.mem.disp } }
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+      if rbest ~= nil then
+        log(fmt('[i] real hit — base reload: "%s" loads from watch cell %X (base before load %X)',
+          rbest.str, rbM[1].addr, rbM[1].preBase))
+        ins, matches = rbest, rbM
+      elseif (#matches == 0 or shadowed) then
+      -- среди совпавших предшественников берём САМУЮ ДЛИННУЮ инструкцию:
+      -- ложные декоды с середины — обрывки настоящей и почти всегда короче
+      -- её (v1.36: раньше бралась первая попавшаяся, и мусор вида
+      -- "add [rax],al" забивал настоящий "mov rax,[статическая_ячейка]")
+      local best, bestMs = nil, nil
+      for _, p in ipairs(preds) do
+        local ms = matchWatched(p, ev.ctx)
+        if #ms &gt; 0 and (best == nil or (p.len or 0) &gt; (best.len or 0)) then
+          best, bestMs = p, ms
+        end
+      end
+      if best ~= nil then
+        -- заменяем совпадения только если walk-back дал что-то новое:
+        -- сентинельное самочтение не двигает цепочку, держатель — двигает
+        local hasNew = (#matches == 0)
+        for _, m in ipairs(bestMs) do
+          local seen = false
+          for _, m2 in ipairs(matches) do
+            if m2.addr == m.addr then seen = true; break end
+          end
+          if not seen then hasNew = true; break end
+        end
+        if hasNew then
+          ins = best
+          matches = bestMs
+          log(fmt('[i] real hit — predecessor: "%s" (CE reported RIP at %X, length %d)',
+            ins.str, ev.rip, ins.len or 0))
+        end
+      end
+      end -- v1.65: конец walk-back/else reload-матча
+    end
+    if #matches &gt; 0 then
+      local tnow = now()
+      for _, m in ipairs(matches) do
+        local w = ABF.watches[m.addr]
+        if w ~= nil then
+          w.hits = w.hits + 1
+          for br in pairs(w.branches) do br.lastHit = tnow end
+          ABF.lastBrHit = tnow  -- v1.86: РЕАЛЬНЫЙ хит ветки (не время создания/GC)
+          ABF.ripWatch[ev.rip] = m.addr  -- v1.91: атрибуция flood-подавленных
+          -- v1.70: дедуп пар (адрес,RIP). В горячем цикле та же инструкция
+          -- читает тот же держатель тысячи раз — повторный подъём не даёт
+          -- новой информации, только сжигает бюджет обработки (walk-back,
+          -- декод). Повторные хиты учитываем в живости ветки и в rateN
+          -- шторм-детектора, но не обрабатываем.
+          local ripTab = ABF.pairSeen[m.addr]
+          if ripTab == nil then ripTab = {}; ABF.pairSeen[m.addr] = ripTab end
+          local pairT = ripTab[ev.rip]
+          -- v1.71: дедуп только для access-хитов. Писцы (write) ходят редко —
+          -- каждый хит это смена значения, и КОПИРУЮЩИЙ писец приносит НОВЫЙ
+          -- источник (другой родитель) при том же RIP: дедуп по паре
+          -- (адрес,RIP) терял эти сигналы (лог Hades 013309: писец
+          -- mov [r14],rax — один, источников десятки).
+          local isRepeat = w.kind == 'access' and pairT ~= nil
+            and (tnow - pairT) &lt; ABF.PAIR_TTL_MS
+          -- штамп ТОЛЬКО при реальной обработке — иначе окно скользит вечно
+          if not isRepeat then
+            ripTab[ev.rip] = tnow
+            if w.kind == 'write' then
+              handleWriteHit(ins, ev, m)
+            else
+              handleAccessHit(ins, ev, m, w)
+            end
+          end
+          -- защита от шторма исключений: горячий watch снимается, адрес
+          -- попадает в чёрный список до конца поиска (level-0 write-watch не
+          -- трогаем — это сенсор значения, без него встанет fresh-scan)
+          if ABF.watches[m.addr] ~= nil then
+            w.rateN = w.rateN + 1
+            local dt = tnow - w.rateT0
+            local isSensor = w.kind == 'write' and m.addr == ABF.rootAddr
+            if dt &gt; ABF.HOT_WINDOW_MS then
+              w.rateN = 1
+              w.rateT0 = tnow
+            elseif w.rateN &gt;= ABF.HOT_HITS and not isSensor then
+              -- v1.97: продуктивный watch не снимаем. Лог 023153: watch
+              -- объекта 1AD7C806BF0 убит на 3-й секунде по ЧИСТОМУ числу
+              -- хитов (120 за 1.6 с, счётчик включает подавленных), а его
+              -- поддерево уже дало несущий контейнер с 328 держателями —
+              -- чёрный список каскадом закрыл единственный путь к золотой
+              -- цепи. Flood-гейт и так ограничивает цену обработки.
+              if w.lastDisc ~= nil and tnow - w.lastDisc &lt; 60000 then
+                log(fmt('[i] watch %X is hot (%d hits in %d ms) but productive '..
+                  '(discovered %d s ago) — kept, flood gate caps the cost',
+                  m.addr, w.rateN, dt, (tnow - w.lastDisc) // 1000))
+                w.rateN = 0
+                w.rateT0 = tnow
+              else
+                log(fmt('[!] watch %X too hot (%d hits in %d ms) — removed, cooldown 60 s',
+                  m.addr, w.rateN, dt))
+                ABF.hotAddrs[m.addr] = tnow
+                removeWatch(m.addr)
+              end
+            end
+          end
+        end
+      end
+      return
+    end
+  end
+
+  -- регистровый сигнал (не зависит от парсинга инструкций)
+  if ABF.level0Armed then
+    if tryRegisterClimb(ev) then
+      return
+    end
+    if ins ~= nil then
+      local ops = { ins.op1, ins.op2 }
+      for _, op in ipairs(ops) do
+        if op.kind == 'mem' and tryObjectBaseClimb(ins, ev, op.mem) then
+          return
+        end
+      end
+    end
+  end
+
+  ABF.strayHits = ABF.strayHits + 1
+  if ABF.strayHits &lt;= 2 then
+    -- диагностика: сырые байты вокруг RIP и что нашёл walk-back
+    local okb, bytes = pcall(readBytes, ev.rip - 24, 40, true)
+    if okb and type(bytes) == 'table' then
+      local hx = {}
+      for i = 1, #bytes do hx[#hx + 1] = fmt('%02X', bytes[i]) end
+      log('[i] bytes [RIP-24 .. RIP+16): ' .. table.concat(hx, ' '))
+    end
+    local ps = {}
+    local preds = findPredecessors(ev.rip)
+    for i, p in ipairs(preds) do
+      if i &gt; 10 then break end
+      ps[#ps + 1] = fmt('%X:%s', p.addr, p.str)
+    end
+    log('[i] RIP predecessors: ' .. (#ps &gt; 0 and table.concat(ps, ' | ') or 'not found'))
+  end
+  -- v1.97: РУБИЛЬНИК PAGE-ШТОРМА. «Соседний» хит = чья-то страница под
+  -- page-guard (нехватка DR). Если страница горячая, хиты идут сотнями в
+  -- секунду, реальных декодов ноль — поиск стоит на месте (лог 023153:
+  -- 8 минут шторма на стековой странице). Считаем промахи по страницам:
+  -- порог — снимаем watch на этой странице и баним адрес до конца поиска.
+  if ins ~= nil then
+    local tbrk = now()
+    local opsP = { ins.op1, ins.op2 }
+    for _, op in ipairs(opsP) do
+      if op.kind == 'mem' then
+        local eff
+        if op.mem.hasRip then
+          eff = op.mem.absAddr and op.mem.disp
+            or (ev.rip + (ins.len or 0) + op.mem.disp)
+        else
+          eff = effAddr(op.mem, ev.ctx)
+        end
+        if eff ~= nil then
+          local pg = eff - eff % 0x1000
+          local st = ABF.pageStorm[pg]
+          if st == nil or tbrk - st.t0 &gt; ABF.PAGE_STORM_MS then
+            st = { n = 0, t0 = tbrk, done = false }
+            ABF.pageStorm[pg] = st
+          end
+          st.n = st.n + 1
+          if st.n &gt;= ABF.PAGE_STORM_N and not st.done then
+            st.done = true
+            -- v1.99: бан ПОСТРАНИЧНЫЙ и не трогает датчик/продуктивные:
+            -- лог 223037: рубильник вынес САМ ДАТЧИК (level-0 watch в той же
+            -- странице) — без него поиск слеп, а мусорные writer-декоды
+            -- («add [rax],al» от живого guard'а) заводили ветки в тупик.
+            ABF.pageBanned[pg] = true
+            local removedN = 0
+            for wa, w2 in pairs(ABF.watches) do
+              if wa - wa % 0x1000 == pg
+                  and not (w2.kind == 'write' and wa == ABF.rootAddr)
+                  and (w2.lastDisc == nil or now() - w2.lastDisc &gt; 60000) then
+                removeWatch(wa)
+                removedN = removedN + 1
+              end
+            end
+            if removedN &gt; 0 then
+              log(fmt('[!] page storm at page %X (RIP %X "%s"): page banned for this run, %d watch(es) removed (sensor kept)',
+                pg, ev.rip, ins.str, removedN))
+            end
+          end
+        end
+      end
+    end
+  end
+  if ABF.strayHits &lt;= 10 or ABF.strayHits % 100 == 0 then
+    if ins ~= nil then
+      log(fmt('[i] hit missed watch addresses (page method, neighbor cell): RIP=%X "%s"%s',
+        ev.rip, ins.str, memOperandInfo(ins, ev.ctx)))
+    else
+      log(fmt('[i] hit missed watch addresses: RIP=%X (decode failed)', ev.rip))
+    end
+  end
+end
+
+------------------------------------------------------------------ ветки: чистка
+local function gcBranches()
+  local t = now()
+  for i = #ABF.branches, 1, -1 do
+    local br = ABF.branches[i]
+    local limit = br.persistent and 300000
+      or (#br.offsets &gt;= 2 and 180000 or 120000) -- v1.71: 45 с рано для тихих игр
+    if t - br.lastHit &gt; limit then
+      -- v1.74: ветка с невооружёнными watchAddrs — не «idle», она ГОЛОДАЕТ
+      -- (слот забрали другие). Закрытие отрезало живую цепочку: в логе 003152
+      -- ветку канонического источника закрыли через 2 мин ПОСЛЕ того, как его
+      -- watch вытолкнули. Отсрочка не бесконечна: 2×limit — и всё же закрываем
+      -- (иначе hot-адреса держали бы ветку вечно).
+      local starved = false
+      for _, wa in ipairs(br.watchAddrs or {}) do
+        if ABF.watches[wa] == nil then starved = true; break end
+      end
+      if starved and t - br.lastHit &lt; limit * 2 then
+        br.lastHit = t  -- перепроверка на следующем проходе
+      else
+        for addr, w in pairs(ABF.watches) do
+          if w.branches[br] then
+            w.branches[br] = nil
+            if next(w.branches) == nil then removeWatch(addr) end
+          end
+        end
+        log(fmt('[-] branch for object %X idle without hits — closed%s',
+          br.obj, br.persistent and ' (structural, 5 min)' or ''))
+        remove(ABF.branches, i)
+      end
+    end
+  end
+  if #ABF.branches &lt; 12 then ABF.specGated = false end
+end
+
+local function processQueue()
+  if not ABF.running then
+    ABF.queue = {}
+    return
+  end
+  local n = 0
+  while #ABF.queue &gt; 0 and n &lt; ABF.PROC_PER_TICK do
+    local ev = remove(ABF.queue, 1)
+    n = n + 1
+    local ok, err = pcall(processHit, ev)
+    if not ok then
+      ABF.errCount = ABF.errCount + 1
+      if ABF.errCount &lt;= 10 then
+        log('[!] hit processing error: ' .. tostring(err))
+      end
+    end
+  end
+  if ABF.dropped &gt; 0 then
+    log(fmt('[i] queue overflowed: %d hits dropped (not a problem)', ABF.dropped))
+    ABF.dropped = 0
+  end
+  gcBranches()
+
+  -- v1.62: режим свежего скана — опрос датчика каждые 300 мс
+  if ABF.running and ABF.resync ~= nil and now() &gt;= (ABF.resync.nextAt or 0) then
+    ABF.resync.nextAt = now() + 300
+    local okr, errr = pcall(resyncPollTick)
+    if not okr then
+      log('[!] fresh-scan mode error: ' .. tostring(errr))
+      ABF.resync = nil
+    end
+  end
+
+  -- БИРСТЫ: watchpoints стоят окнами, между ними игра отдыхает.
+  -- v1.90: пауза — АДАПТИВНАЯ. Если бурст дал хиты (ячейки живые, отладчик
+  -- стабилен) — продолжаем БЕЗ паузы: в Absolum держатели читаются
+  -- непрерывно, и 20% простоя = пропущенные хиты (вопрос пользователя
+  -- «нужна ли пауза» — в C++ играх не нужна). Пауза остаётся для бурстов
+  -- вхолостую (что-то не так с ячейками — даём игре передышку).
+  if ABF.running then
+    local t = now()
+    if ABF.burstEnds &gt; 0 and t &gt; ABF.burstEnds then
+      local removed = 0
+      local accHits = 0
+      for addr, w in pairs(ABF.watches) do
+        if w.kind ~= 'write' then
+          accHits = accHits + (w.hits or 0)
+          removeWatch(addr)
+          removed = removed + 1
+        end
+      end
+      ABF.burstEnds = 0
+      if ABF.burstHitsAtStart ~= nil and accHits &gt; ABF.burstHitsAtStart then
+        ABF.nextBurstAt = t  -- живой бурст — не снимаем наблюдение
+      else
+        ABF.nextBurstAt = t + ABF.PAUSE_MS
+        if removed &gt; 0 then
+          log(fmt('[i] idle burst — pause %d ms, the game rests', ABF.PAUSE_MS))
+        end
+      end
+    elseif ABF.burstEnds == 0 and ABF.nextBurstAt &gt; 0 and t &gt;= ABF.nextBurstAt then
+      -- переармливание по глубине: самые глубокие ветки первыми (они ближе
+      -- к статике и дороже всех в бюджете), не больше 3 за заход
+      local cands = {}
+      for i = #ABF.branches, 1, -1 do
+        local br = ABF.branches[i]
+        if not br.done then
+          for _, addr in ipairs(br.watchAddrs or {}) do
+            if ABF.watches[addr] == nil and ABF.pageBanned[addr] == nil
+                and not (ABF.hotAddrs[addr] ~= nil
+                and now() - ABF.hotAddrs[addr] &lt; ABF.HOT_COOLDOWN_MS)
+                and not isStackish(addr) then
+              insert(cands, { br = br, addr = addr, depth = #br.offsets })
+            end
+          end
+        end
+      end
+      table.sort(cands, function(x, y)
+        -- v1.84: ветки с настоящими держателями — первыми (persistent —
+        -- вторым признаком): спекулятивные интерьер-ветки в логах
+        -- вытесняли живые holder-ветки из бурстов (160832: сходимость
+        -- к 2-держательному объекту заняла 3.5 мин из-за параллельных лестниц)
+        if (x.br.holderHop and true or false) ~= (y.br.holderHop and true or false) then
+          return (x.br.holderHop and true or false)
+        end
+        if (x.br.persistent and true or false) ~= (y.br.persistent and true or false) then
+          return (x.br.persistent and true or false)
+        end
+        -- при РАВНОЙ глубине первым идёт СТАРШАЯ ветка (меньший id):
+        -- она нашлась раньше и ближе к цели. Раньше равные по глубине
+        -- сортировались в порядке вставки, и свежие мелкие кандидаты
+        -- отбрасывали старших из очереди перевооружения (Absolum 020408:
+        -- держатели уровня 3 ни разу не получили слот за 5 минут).
+        if x.depth ~= y.depth then return x.depth &gt; y.depth end
+        return (x.br.id or 0) &lt; (y.br.id or 0)
+      end)
+      -- v1.88: КРУГОВОЕ ВРАЩЕНИЕ очереди. Раньше каждый бурст перевооружал
+      -- ОДНИ И ТЕ ЖЕ первые 3 кандидата (сортировка детерминирована, после
+      -- паузы все watch сняты) — холодные держатели из начала очереди
+      -- голодали навсегда, горячие глубже очереди не получали слотов
+      -- (лог 172649: 328-слотовый контейнер, 90 с одних и тех же троих).
+      -- Теперь стартовый индекс смещается на число вооружённых: полная
+      -- прокрутка очереди гарантирована.
+      local rearmed = 0
+      if #cands &gt; 0 then
+        local start = (ABF.burstRR or 0) % #cands
+        for k = 0, #cands - 1 do
+          if rearmed &gt;= 3 then break end
+          local c = cands[(start + k - 1) % #cands + 1]
+          if addWatch(c.addr, 'access', 8, c.br) then
+            rearmed = rearmed + 1
+          end
+        end
+        ABF.burstRR = start + rearmed
+      end
+      ABF.nextBurstAt = 0
+      if rearmed &gt; 0 then
+        -- v1.90: снапшот access-хитов на старте бурста (для адаптивной паузы)
+        local h0 = 0
+        for _, w in pairs(ABF.watches) do
+          if w.kind ~= 'write' then h0 = h0 + (w.hits or 0) end
+        end
+        ABF.burstHitsAtStart = h0
+        ABF.burstEnds = now() + ABF.BURST_MS
+        log(fmt('[i] new burst: %d watchpoint(s) are up again', rearmed))
+      end
+    end
+  end
+
+  -- контроль живучести корневого адреса и обратная связь в статусе
+  if ABF.running and ABF.level0Armed and ABF.rootAddr ~= nil and ABF.typeName ~= nil then
+    local t = now()
+    if t - (ABF.lastCheck or 0) &gt; 2000 then
+      ABF.lastCheck = t
+      -- v1.70: подавленные flood-гейтом повторы — тоже признак жизни
+      local noHits = (ABF.hitCount + (ABF.floodHits or 0))
+        == ((ABF.hitsAtCheck or 0) + (ABF.floodAtCheck or 0))
+      -- v1.97: ДАМП WATCH-СПИСКА раз в 30 с — диагностика на месте, а не в
+      -- следующем раунде «смотри логи» (в логе 023153 неизвестно было, КАКОЙ
+      -- watch штормит страницу).
+      if t - (ABF.lastWatchDump or 0) &gt; 30000 and ABF.validating == nil then
+        ABF.lastWatchDump = t
+        local parts = {}
+        for addr, w in pairs(ABF.watches) do
+          if #parts &lt; 6 then
+            parts[#parts + 1] = fmt('%X(%s,%d)', addr,
+              w.kind == 'write' and 'w' or 'a', w.hits or 0)
+          end
+        end
+        local banned = 0
+        for _ in pairs(ABF.pageBanned) do banned = banned + 1 end
+        log(fmt('[i] watches(%d): %s%s', ABF.watchCount,
+          #parts &gt; 0 and table.concat(parts, ' ') or 'none',
+          banned &gt; 0 and fmt(' | page-banned: %d', banned) or ''))
+        -- v1.98: если ветки стоят, а хитов на НИХ нет минуту за минутой,
+        -- при живом датчике — CE не обслуживает watchpoints (page-метод/мёртвый
+        -- дебаггер). Честно советуем перезапуск привязки, а не молчаливый шторм.
+        local anyHolder = false
+        local holderHits = 0
+        for _, w in pairs(ABF.watches) do
+          if w.kind == 'access' then
+            anyHolder = true
+            holderHits = holderHits + (w.hits or 0)
+          end
+        end
+        if ABF.validating == nil and anyHolder and holderHits == 0
+            and ABF.lastTickAt ~= nil and t - ABF.lastTickAt &lt; 120000
+            and t - ABF.lastProgress &gt; 90000 and not ABF.serveWarned then
+          ABF.serveWarned = true
+          log('[!] holder watchpoints get NO hits for minutes while the value keeps '..
+            'changing — CE is not serving the debug registers (page-method fallback). '..
+            'Fix: press Stop, close the process in CE (computer icon) and attach again, then Start.')
+        end
+      end
+      -- v1.97: ДЕТЕКТОР СТАГНАЦИИ. Хиты текут, открытий нет STAG_MS — поиск
+      -- застрял (page-шторм, мёртвые ветки): снимаем всё и перезапускаемся
+      -- через fresh-scan (скан сразу после следующего тика значения).
+      -- лимбо: не validation, не fresh-scan, а watch и веток НЕТ — поиск
+      -- крутится вхолостую (после STALE-перезапуска датчик мёртв, хиты ушли)
+      local limbo = ABF.validating == nil and ABF.resync == nil
+        and ABF.pendingCands == nil and ABF.watchCount == 0
+        and #ABF.branches == 0
+        and t - (ABF.lastProgress or 0) &gt; 60000
+      if (ABF.validating == nil and ABF.resync == nil
+          and ABF.lastProgress &gt; 0 and t - ABF.lastProgress &gt; ABF.STAG_MS
+          and not noHits) or limbo then
+        local totalHits = ABF.hitCount + (ABF.floodHits or 0)
+        log(fmt('[!] no discovery for %d min while hits keep flowing (%d total) — '..
+          'the search is stuck. Restarting via fresh-scan.',
+          ABF.STAG_MS // 60000, totalHits))
+        removeAllWatches()
+        ABF.branches = {}
+        ABF.lastProgress = t
+        startResync('search restarted: the scheduler will rescan right after the next value change.')
+      end
+      -- v1.68: ЖНЕЦ — access-watch без единого хита за SPEC_TTL_MS освобождает
+      -- DR-слот. Мусорные ячейки-держатели от старых поколений GC иначе занимают
+      -- слоты вечно и душат подъём (подтверждённые хитами не трогаются).
+      do
+        local reaped = {}
+        for addr, w in pairs(ABF.watches) do
+          if w.kind == 'access' and w.hits == 0 and next(w.branches) ~= nil
+              and t - (w.t0 or 0) &gt; ABF.SPEC_TTL_MS then
+            reaped[#reaped + 1] = addr
+          end
+        end
+        for _, addr in ipairs(reaped) do
+          -- v1.91: БЕЗ чёрного списка — декод-мусор делал живые ячейки
+          -- «нуль-хитовыми», blacklist на 60 с выкидывал их из ротации
+          removeWatch(addr)
+          log(fmt('[-] speculative holder %X: no hits in %d s — slot released',
+            addr, ABF.SPEC_TTL_MS / 1000))
+        end
+        -- v1.87: ЖНЕЦ СИРОТ — access-watch без единой живой ветки не служит
+        -- ничему, но занимает DR-слот (хиты у него есть, обычный жнец не
+        -- берёт). Чистим каждый проход: слот возвращается очереди.
+        for addr, w in pairs(ABF.watches) do
+          if w.kind == 'access' and next(w.branches) == nil then
+            reaped[#reaped + 1] = addr
+          end
+        end
+        for _, addr in ipairs(reaped) do
+          if ABF.watches[addr] ~= nil then
+            removeWatch(addr)  -- v1.91: без blacklist (см. выше)
+            log(fmt('[-] orphaned watch %X (its branch closed) — slot released', addr))
+          end
+        end
+      end
+      -- v1.91: атрибуция устаревает вместе с дедупом; при переполнении — wipe
+      local rwN = 0
+      for _ in pairs(ABF.ripWatch) do rwN = rwN + 1 end
+      if rwN &gt; 512 then ABF.ripWatch = {} end
+      -- v1.70: чистка дедупа пар (адрес,RIP)
+      for addr, rt in pairs(ABF.pairSeen) do
+        for rip, pt in pairs(rt) do
+          if t - pt &gt; ABF.PAIR_TTL_MS then rt[rip] = nil end
+        end
+        if next(rt) == nil then ABF.pairSeen[addr] = nil end
+      end
+      -- v1.90: СУСПЕНЗИЯ КОРНЕВОГО WATCH. На глубине &gt;= 2 корневой
+      -- write-watch свою главную работу сделал (подъём идёт по держателям),
+      -- а занимает 1 из 4 DR-слотов = минус 33% наблюдения. Датчик значения
+      -- продолжает опрашиваться таймером (readTyped в матурации/recovery),
+      -- так что fresh-scan и восстановление не страдают. Возвращаем watch,
+      -- если ветки умерли (снова нужен level-0 путь).
+      do
+        local deepAlive = ABF.maxDepth &gt;= 2 and #ABF.branches &gt; 0
+        if deepAlive and not ABF.rootSuspended
+            and ABF.watches[ABF.rootAddr] ~= nil and ABF.resync == nil then
+          removeWatch(ABF.rootAddr)
+          ABF.rootSuspended = true
+          log('[i] root watch suspended — DR slot given to holder watches (sensor still polled)')
+        elseif (not deepAlive) and ABF.rootSuspended
+            and ABF.rootAddr ~= nil and ABF.watches[ABF.rootAddr] == nil then
+          if addWatch(ABF.rootAddr, 'write', valSize(ABF.typeName), nil, nil) then
+            ABF.rootSuspended = false
+            log('[i] root watch re-armed — deep branches are gone')
+          end
+        end
+      end
+      -- v1.95: ВАЛИДАЦИОННОЕ ОКНО найденной цепи (120 с). Каждые 5 с
+      -- переоцениваем цепь против ТЕКУЩЕГО значения датчика: настоящая цепь
+      -- следует за значением всегда, копия протухает при смене экрана/GC.
+      if ABF.validating ~= nil and t - (ABF.lastValidCheck or 0) &gt;= 5000 then
+        ABF.lastValidCheck = t
+        local v = ABF.validating
+        -- v2.10: цепь оценивает САМ CE (getCurrentAddress записи — порядок
+        -- офсетов канонический). Фолбэк — выражение цепи целиком через
+        -- getAddressSafe (скобочные выражения CE вычисляет сам).
+        local chainVal = nil
+        local chainEnd = nil
+        pcall(function()
+          if v.mr ~= nil then chainEnd = v.mr.getCurrentAddress() end
+        end)
+        if type(chainEnd) ~= 'number' or chainEnd &lt; 0x10000 then
+          pcall(function() chainEnd = getAddressSafe(v.path) end)
+        end
+        if type(chainEnd) == 'number' and chainEnd &gt; 0x10000 then
+          local okR, rv = pcall(readTyped, chainEnd, ABF.typeName)
+          if okR then chainVal = rv end
+        end
+        local okS2, sv2 = pcall(readTyped, ABF.rootAddr, ABF.typeName)
+        -- v1.95.1: датчик умер (перезапуск игры)? Сравнение теряет смысл —
+        -- ЗАМОРАЖИВАЕМ окно (не копим время, не считаем дрейфом) и ждём:
+        -- либо игра вернётся и валидация продолжится, либо вотчдог корня
+        -- сам признает адрес мёртвым. Запись не трогаем — модульная цепь
+        -- может быть валидной и после рестарта.
+        if not okS2 or sv2 == nil then
+          v.t0 = v.t0 + (t - (ABF.lastValidCheck or t))
+          if not v.sensorDead then
+            v.sensorDead = true
+            log('[i] sensor lost during validation — window paused (record kept).')
+          end
+        elseif chainVal == nil then
+          -- v2.06: цепь не резолвится = какой-то узел временно нечитаем (GC
+          -- пересобирает иерархию / сцена грузится) — это НЕ «цепь мертва».
+          -- Пользователь стоит на месте, а цепь мигает десятки секунд
+          -- (лог 022125: 31 с nil → золотая цепь помечена WRONG?).
+          -- Терпим весь проверочный интервал: если цепь снова читается и
+          -- сходится — досрочный VALIDATED (пережить сбой — лучший аргумент
+          -- валидности). Не читается до конца окна — (WRONG?), запись остаётся.
+          if v.nilSince == nil then
+            v.nilSince = t
+            v.hadNil = true
+            log('[i] chain diag: the record does not resolve right now (a node in the chain is unreadable).')
+          end
+          -- v2.07: НИКОГДА не помечаем (WRONG?) за нечитаемость: игра может
+          -- минутами держать иерархию выгруженной (меню/загрузка), а цепь —
+          -- канонической (лог 025000: 124 с nil → золотая цепь помечена).
+          -- Валидация замирает и ждёт восстановления; запись остаётся
+          -- (120s check), пользователь может остановить поиск вручную.
+          if t - (v.nilLastLog or 0) &gt; 60000 then
+            v.nilLastLog = t
+            log(fmt('[i] chain still unreadable for %d s — validation paused, record kept. '..
+              'It will be validated automatically once the game rebuilds the hierarchy.',
+              (t - v.nilSince) // 1000))
+          end
+          -- v2.09: 120 с непрерывной нечитаемости (те же, что в имени записи)
+          -- = игра перестроила иерархию, статический путь ведёт на освобождённый
+          -- узел (030356: hop3 freed, деньги тикают в другой копии). Помечаем
+          -- (WRONG?) (запись остаётся и оживёт при повторной находке) и
+          -- продолжаем поиск — зависшая валидация блокирует новые находки.
+          if t - v.nilSince &gt; 120000 then
+            log(fmt('[!] chain unreadable for %d min (hierarchy rebuilt?) — record kept as WRONG?, search continues.',
+              (t - v.nilSince) // 60000))
+            toast('Chain unreadable 5 min — kept as WRONG?', 0x0000FF, 500)
+            pcall(function()
+              local mr = getAddressList().getMemoryRecordByDescription('Pointer Finder (120s check): ' .. v.path)
+              if mr ~= nil then
+                mr.Description = 'Pointer Finder (WRONG?): ' .. v.path
+                mr.Color = 0x808080
+              end
+            end)
+            ABF.rejectedChains[v.path] = true
+            ABF.validating = nil
+            ABF.lastRearm = t
+          end
+        else
+          local recovered = v.hadNil == true  -- цепь пережила период нечитаемости
+          v.nilSince = nil
+          local tol = math.max(100, math.abs(sv2) * 0.02)
+          local matches = chainVal ~= nil and math.abs(chainVal - sv2) &lt;= tol
+          if matches then
+            v.lastOk = t
+            if v.sensorDead then
+              v.sensorDead = false
+              log('[i] sensor is back — validation resumed.')
+            end
+          end
+          -- v2.02: любое устойчивое расхождение при РЕЗОЛВЯЩЕЙСЯ цепи —
+          -- перезаякориваем датчик на конец цепи и храним запись, а не режем.
+          -- Отвергнуть цепь можно только когда она перестала резолвиться
+          -- (узел умер). Старое условие (датчик замер + цепь движется) было
+          -- слишком узким — Absolum 011948: золотая цепь срезана на 67-й с.
+          if not matches and chainVal ~= nil and not v.reanchored
+              and t - v.lastOk &gt; 15000 then
+            v.reanchored = true
+            local newRoot = chainEnd
+            ABF.rootAddr = newRoot
+            v.lastOk = t
+            v.t0 = t  -- окно валидации заново — якорь сменился
+            log(fmt('[!] chain diverged from the sensor but still resolves — '..
+              're-anchoring the sensor to %X (chain=%s sensor=%s; record kept, '..
+              'validation restarts).', newRoot, tostring(chainVal), tostring(sv2)))
+          end
+          v.prevChainVal = chainVal
+          v.prevSensorVal = sv2
+          -- v2.06: цепь снова резолвится и сходится ПОСЛЕ сбоя нечитаемости —
+          -- досрочный VALIDATED: пережить разрыв и продолжать следовать за
+          -- значением — сильнейшее подтверждение каноничности.
+          if matches and recovered and not v.reanchored then
+            log('[★] chain recovered from unreadable window and matches — VALIDATED early.')
+            toast('Chain validated — DONE', 0x00FF00, 1200)
+            pcall(function()
+              local mr = getAddressList().getMemoryRecordByDescription('Pointer Finder (120s check): ' .. v.path)
+              if mr ~= nil then
+                mr.Description = 'Pointer Finder: ' .. v.path
+                pcall(function() mr.Color = 0x000000 end)
+              end
+            end)
+            ABF.validating = nil
+            stopAll(true)
+          elseif t - v.t0 &gt;= 120000 then
+            if matches then
+              log('[★] chain VALIDATED (survived 120 s of gameplay) — search complete.')
+              toast('Chain validated — DONE', 0x00FF00, 1200)
+              pcall(function()
+                local mr = getAddressList().getMemoryRecordByDescription('Pointer Finder (120s check): ' .. v.path)
+                if mr ~= nil then
+                  mr.Description = 'Pointer Finder: ' .. v.path
+                  pcall(function() mr.Color = 0x000000 end)
+                end
+              end)
+              ABF.validating = nil
+              stopAll(true)
+            else
+              -- v2.02: цепь перестала резолвиться (узел умер) — запись
+              -- НЕ удаляется: переименовывается в REJECTED и остаётся в
+              -- таблице для ручной проверки пользователем.
+              log(fmt('[!] chain went STALE during validation (chain=%s sensor=%s) — '..
+                'record kept as WRONG?, search continues.',
+                tostring(chainVal), tostring(sv2)))
+              toast('Chain went stale — kept as WRONG?', 0x0000FF, 500)
+              pcall(function()
+                local mr = getAddressList().getMemoryRecordByDescription('Pointer Finder (120s check): ' .. v.path)
+                if mr ~= nil then
+                  mr.Description = 'Pointer Finder (WRONG?): ' .. v.path
+                  mr.Color = 0x808080
+                end
+              end)
+              ABF.rejectedChains[v.path] = true
+              ABF.validating = nil
+              ABF.lastRearm = t
+            end
+          else
+            if not matches and t - v.lastOk &gt; 15000 and not v.sensorDead
+                and v.reanchored then
+              -- 15+ с расхождения ПОСЛЕ перезаякоривания — цепь сломалась
+              -- (v2.02: пометка вместо удаления)
+              log(fmt('[!] chain went STALE during validation (chain=%s sensor=%s) — '..
+                'record kept as WRONG?, search continues.',
+                tostring(chainVal), tostring(sv2)))
+              toast('Chain went stale — kept as WRONG?', 0x0000FF, 500)
+              pcall(function()
+                local mr = getAddressList().getMemoryRecordByDescription('Pointer Finder (120s check): ' .. v.path)
+                if mr ~= nil then
+                  mr.Description = 'Pointer Finder (WRONG?): ' .. v.path
+                  mr.Color = 0x808080
+                end
+              end)
+              ABF.rejectedChains[v.path] = true
+              ABF.validating = nil
+              ABF.lastRearm = t
+            elseif t - (ABF.lastValidStatus or 0) &gt; 5000 then
+              ABF.lastValidStatus = t
+              setStatus(fmt('Validating the found chain: %d/%d s — keep playing, change screens',
+                (t - v.t0) / 1000, 120))
+            end
+          end
+        end
+      end
+      -- v1.61: созревание кандидатов (проверка живости по тику денег)
+      -- v1.71: зреем до СЛЕДУЮЩЕГО изменения значения датчика. Живой кандидат
+      -- — это ячейка, которая СЛЕДОВАЛА за изменением; в играх с редкими
+      -- изменениями (Hades: раз в 30-60 с) окно 2.5 с объявляло мёртвыми
+      -- ВСЕХ, включая настоящее хранилище. Таймаут ожидания 120 с: если датчик
+      -- молчит так долго, проверяем как раньше (стабильность — тоже улика).
+      if ABF.pendingCands ~= nil then  -- v1.98: без гейта noHits — page-шторм
+        -- корневого guard'а держал хиты вечно и блокировал проверку кандидатов
+        local elapsed = t - (ABF.pendingT0 or 0)
+        if elapsed &gt;= 2500 then
+          local okr, rv = pcall(readTyped, ABF.rootAddr, ABF.typeName)
+          local sensorMoved = okr and rv ~= nil and ABF.pendingSensorVal ~= nil
+            and math.abs(rv - ABF.pendingSensorVal) &gt;= 0.5
+          -- v1.98: таймаут 120 с без тика датчика — улики НЕТ (и за и против).
+          -- Раньше проверка без тика объявляла мёртвыми ЖИВЫЕ ячейки (лог
+          -- 154333: деньги тикают раз в 15-20 с — все кандидаты «умирали»).
+          -- Продлеваем окно (5 продлений = 10 мин, потом тихий fresh-scan).
+          if sensorMoved then
+            local armed, aliveN, deadN = armPendingLiveCandidates(3)
+            if armed &gt; 0 then
+              ABF.burstEnds = 0
+              ABF.lastRearm = t
+              -- v1.71: вернуть watch на введённый адрес — самовосстановление
+              -- снимало ВСЕ watchpoints, и датчик уровня 0 пропадал: тики
+              -- больше не давали хитов, и подъём умирал в тишине
+              if ABF.rootAddr ~= nil and ABF.watches[ABF.rootAddr] == nil then
+                addWatch(ABF.rootAddr, 'write', valSize(ABF.typeName), nil, nil)
+              end
+              ABF.recRefVal = rv    -- отсчёт тишины заново с текущего значения
+              log('[=] search continued from live candidates — wait for "BASE ADDRESS FOUND".')
+            else
+              ABF.pendingCands = nil
+              ABF.lastRearm = t
+              -- v1.62: все кандидаты мертвы — не просим пользователя, сканируем
+              -- сами сразу после следующего изменения значения
+              startResync('all collected candidates turned out to be dead.')
+            end
+          elseif elapsed &gt;= 120000 then
+            ABF.pendingExt = (ABF.pendingExt or 0) + 1
+            if ABF.pendingExt &gt;= 5 then
+              ABF.pendingCands = nil
+              ABF.pendingExt = 0
+              startResync('candidates waited 10 minutes without a single value change — re-collecting after the next change.')
+            else
+              ABF.pendingT0 = t - 2500
+              log('[i] candidates kept waiting — the value has not changed yet (no evidence either way).')
+            end
+          elseif elapsed &gt;= 10000 and t - (ABF.pendingHintAt or 0) &gt; 20000 then
+            ABF.pendingHintAt = t
+            setStatus(fmt('Waiting for the next value change to verify %d candidate(s) — trigger it in the game.',
+              #ABF.pendingCands))
+            log(fmt('[i] %d candidate(s) collected — verifying at the NEXT value change (this game changes it rarely).',
+              #ABF.pendingCands))
+          end
+        end
+      elseif noHits and ABF.resync == nil then
+        -- v1.86: восстановление по РЕАЛЬНЫМ хитам веток. Два бага старого
+        -- тик-гейта (лог 165303: 4.5 мин ступора при живых триггерах):
+        -- (1) br.lastHit освежался защитой голодных веток (v1.74) и временем
+        -- создания — «branches got hits recently» было вечно истинно;
+        -- (2) гейт требовал 12 с ПОЛНОЙ тишины хитов — при триггерах раз в
+        -- 3-5 с он не созревал никогда. Теперь: датчик тикал за последнюю
+        -- минуту, а НИ ОДНА ветка не получила хита 60+ с → ветки мертвы,
+        -- переиск (тихая игра без тиков не давит на восстановление).
+        local okr2, rv2 = pcall(readTyped, ABF.rootAddr, ABF.typeName)
+        if okr2 and rv2 ~= nil then
+          if ABF.recRefVal == nil then
+            ABF.recRefVal = rv2
+          elseif math.abs(rv2 - ABF.recRefVal) &gt;= 0.5 then
+            ABF.recRefVal = rv2
+            ABF.lastTickAt = t
+          end
+        end
+        if ABF.lastTickAt ~= nil and t - ABF.lastTickAt &lt; 60000
+            and t - (ABF.lastBrHit or 0) &gt;= 60000
+            and t - (ABF.lastRearm or 0) &gt; 30000 then
+        -- v1.61: уровни умерли (GC) или адрес был мёртв изначально.
+        -- Предохранитель: 3 сброса подряд без единого хита — честно признаём
+        -- адрес мёртвым.
+        ABF.lastRearm = t
+        ABF.rearmCount = (ABF.rearmCount or 0) + 1
+        if ABF.rearmCount &gt; 3 then
+          if not ABF.deadAddrLogged then
+            ABF.deadAddrLogged = true
+            log('[!] 3 recoveries without a single hit — the entered address looks '..
+              'dead (stack/freed memory/wrong value). Do a fresh scan '..
+              'RIGHT AFTER the value changes and enter a new address.')
+            if (ABF.lastGhostCount or 0) &gt; 0 then
+              log(fmt('[!] NOTE: %d stale CE breakpoint record(s) were present at Start — '..
+                'CE serves breakpoints unreliably in this state. Close the process in CE '..
+                '(computer icon) and attach again, then Start once more.',
+                ABF.lastGhostCount))
+            end
+          end
+        else
+          log(fmt('[i] value ticking but no branch hits for 60 s (self-recovery %d/3) — re-searching live copies...',
+            ABF.rearmCount))
+          ABF.branches = {}
+          removeAllWatches()
+          local collected = collectLiveCandidates()
+          if collected &gt; 0 then
+            log(fmt('[i] collected %d candidates — the watchdog will verify liveness by the money tick.', collected))
+          else
+            -- v1.62: пусто → режим свежего скана вместо ручного повтора
+            startResync('no copies with this value (the value changed since it was read).')
+          end
+        end
+      end
+      -- v1.84/v1.86: тихая подсказка — значение НЕ тикает 60+ с (игрок
+      -- забыл триггерить) ИЛИ тикает, но ветки молчат: смена активности
+      -- полезнее повторных триггеров (держатели читаются разной логикой).
+      -- v1.88: только если ветки УЖЕ жили (lastBrHit &gt; 0) — на старте
+      -- подсказка стреляла на первой секунде (лог 172649: 17:26:50)
+      if (ABF.lastBrHit or 0) &gt; 0 and t - ABF.lastBrHit &gt; 60000
+          and t - (ABF.quietHintAt or 0) &gt; 90000 then
+        ABF.quietHintAt = t
+        toast('No accesses for 60 s — try OTHER actions in the game', 0x00FFFF, 500)
+        log('[i] hint: holder cells are read by different game logic — try menus/combat/room transitions.')
+      end
+      end -- v1.86: конец гейта восстановления
+      ABF.hitsAtCheck = ABF.hitCount
+      ABF.floodAtCheck = ABF.floodHits or 0
+      if ABF.resync == nil and ABF.validating == nil then -- не затирать статусы fresh-scan/валидации
+        setStatus(fmt('Watchpoints: %d processed, %d stray decodes — trigger a value change in the game',
+          ABF.hitCount, ABF.strayHits))
+      end
+    end
+  end
+end
+
+------------------------------------------------------------------ старт / стоп
+stopAll = function(finished)
+  local wasRunning = ABF.running
+  ABF.running = false
+  ABF.level0Armed = false
+  ABF.resync = nil           -- v1.62: тушим режим свежего скана
+  ABF.validating = nil       -- v1.95: валидационное окно закрыто
+  ABF.queue = {}
+  ABF.branches = {}
+  ABF.burstEnds = 0
+  ABF.nextBurstAt = 0
+  removeAllWatches()
+  -- страховка от утечек (v1.38): брейкпоинт, оставшийся в CE от прерванного
+  -- запуска, съедает DR-слот — CE деградирует в page-метод и устраивает шторм
+  local okl, bplist = pcall(debug_getBreakpointList)
+  if okl and type(bplist) == 'table' then
+    for _, a in ipairs(bplist) do
+      local na = tonumber(a) or tonumber(tostring(a), 16)
+      if na ~= nil and na ~= 0 then
+        local okR, errR = pcall(debug_removeBreakpoint, na)
+        if not okR then
+          -- v1.39: молча проглотить ошибку = вечно живущая утечка; показываем
+          log(fmt('[!] failed to remove breakpoint %X: %s', na, tostring(errR)))
+        end
+      end
+    end
+  end
+  if ABF.btnStop ~= nil then ABF.btnStop.Enabled = false end
+  if finished and ABF.btnAdd ~= nil then ABF.btnAdd.Enabled = true end
+  if not finished and wasRunning then
+    setStatus('Stopped.')
+    log('[=] stopped, all breakpoints removed')
+    toast('stopped', 0x888888)
+  end
+end
+ABF.stopAll = stopAll  -- для внешнего загрузчика (abfReload)
+
+local function readTypedRoot(addr, tn)
+  return readTyped(addr, tn)
+end
+
+local function startSearch()
+  -- v1.57: новый файл лога на каждое нажатие «Старт» — логи не разрастаются.
+  -- v1.66: логи в %TEMP% (путь зависит от машины, не хардкодим)
+  ABF.LOG_PATH = (os.getenv('TEMP') or '.') .. [[\pointerfinder_log_]] ..
+    os.date('%Y-%m-%d_%H%M%S') .. [[.txt]]
+  log('[i] log: ' .. ABF.LOG_PATH)
+  if getOpenedProcessID() == 0 then
+    -- v1.69: не блокируем поток модальным диалогом — статус и лог
+    setStatus('Attach CE to the game first (the computer icon at the top left)!')
+    log('[!] Attach CE to the game first (the computer icon at the top left)!')
+    return
+  end
+
+  local sAddr = trim(ABF.edAddr.Text)
+  if sAddr == '' then
+    setStatus('Enter an address.')
+    return
+  end
+  local addr = getAddressSafe(sAddr)
+  if addr == nil then addr = tonumber(sAddr, 16) end
+  if addr == nil or addr == 0 then
+    setStatus('Failed to parse address: ' .. sAddr)
+    return
+  end
+
+  local tn = ABF.cbType.Items[ABF.cbType.ItemIndex]
+  if tn == nil then tn = 'Double' end
+  ABF.customSize = tonumber(ABF.cbCust.Text) or 4
+  ABF.typeName = tn
+
+  local evStr = tostring(ABF.edValue.Caption or ''):gsub(',', '.')
+  ABF.expected = tonumber(evStr)
+
+  local cur = readTypedRoot(addr, tn)
+  if cur == nil then
+    -- v1.69: не блокируем поток модальным диалогом — статус и лог
+    setStatus(fmt('Address %s is not readable — check it.', hex(addr)))
+    log(fmt('[!] Address %s is not readable — check it.', hex(addr)))
+    return
+  end
+
+  stopAll(false)
+  -- v1.98: улики ПРОШЛОГО прогона сбрасываем — иначе recovery-гейт («датчик
+  -- тикал за минуту, ветки молчат 60 с») срабатывает через 2 с после Старта
+  -- по чужим тикам и сносит свежий уровень-0 watch (логи 154317/154605).
+  ABF.lastTickAt = nil
+  ABF.lastBrHit = now()
+  ABF.lastRearm = now()
+  ABF.recRefVal = nil
+  ABF.rearmCount = 0
+  ABF.lastGhostCount = nil
+  ABF.pendingExt = 0
+  ABF.serveWarned = nil
+  log(fmt('[=] start: address %X, type %s, current value %s', addr, tn, tostring(cur)))
+
+  local ifc = debug_getCurrentDebuggerInterface()
+  if ifc == nil then
+    debugProcess(2)  -- VEH
+    log('[i] VEH debugger attached')
+    ifc = debug_getCurrentDebuggerInterface()
+  end
+  log(fmt('[i] debugger interface: %s (2=VEH, 1=windows, 3=kernel)', tostring(ifc)))
+
+  -- v1.49: размер указателя. Если CE ошибся разрядностью (думает 32-бит),
+  -- UI-вычисление pointer-записей читает 4 байта и ломается — все pointer-ы
+  -- показывают «??», а плоские записи работают. Принудительно 8 (x64-игры)
+  local psOk, ps = pcall(getPointerSize)
+  if not psOk or ps ~= 8 then
+    pcall(setPointerSize, 8)
+    local ps2 = select(2, pcall(getPointerSize))
+    log(fmt('[i] pointer size was %s, set to 8 (now %s)',
+      tostring(ps), tostring(ps2)))
+  else
+    log(fmt('[i] pointer size: %d', ps))
+  end
+
+  ABF.processed   = {}
+  ABF.stackRootWarned = false
+  ABF.lastAnyHit = now()
+  ABF.lastRearm = 0
+  ABF.rearmCount = 0
+  ABF.deadAddrLogged = false
+  ABF.pendingCands = nil
+  ABF.pendingT0 = 0
+  ABF.resync = nil           -- v1.62: каждый «Старт» — с чистого листа
+  ABF.rejectedChains = {}    -- v1.65: отпечатки отбракованных цепочек
+  -- v1.53/v1.66: файл самопроверки — в %TEMP%, рядом с логами
+  -- (не засоряем рабочий стол; путь показывается в логе)
+  ABF.SELFCHECK_PATH = (os.getenv('TEMP') or '.') .. [[\PointerFinder_selfcheck.txt]]
+  pcall(function()
+    local f = io.open(ABF.SELFCHECK_PATH, 'wb')
+    if f ~= nil then
+      f:write('Pointer Finder ' .. ABF.VERSION .. ' selfcheck, pid=' .. tostring(getOpenedProcessID()) ..
+        '\n')
+      f:close()
+    end
+  end)
+  log('[i] chain selfcheck: ' .. ABF.SELFCHECK_PATH)
+  -- v1.92: РЕВИЗИЯ СТАРЫХ ЗАПИСЕЙ («rescan after restart» из best practices,
+  -- автоматически): все записи «Pointer Finder: …» проверяются против
+  -- ТЕКУЩЕГО значения датчика. Пережили рестарт — зелёный; протухли —
+  -- честный отчёт (цепочка была сессионной).
+  do
+    local okS, sv = pcall(readTyped, ABF.rootAddr, ABF.typeName)
+    if okS and sv ~= nil then
+      local alive, stale = 0, 0
+      pcall(function()
+        local al = getAddressList()
+        for i = 0, al.Count - 1 do
+          local mr = al.getMemoryRecord(i)
+          local d = tostring(mr.Description or '')
+          local isFinal = d:sub(1, 16) == 'Pointer Finder: '
+          local isCheck = d:sub(1, 29) == 'Pointer Finder (120s check): '
+          if isFinal or isCheck then
+            local okC, cur = pcall(function() return mr.getCurrentAddress() end)
+            -- v2.04: getCurrentAddress ленив (v1.85) — после переименования
+            -- возвращает мусор до перерисовки GUI; фолбэк к getAddressSafe
+            if not okC or type(cur) ~= 'number' or cur &lt; 0x10000 then
+              pcall(function()
+                local a = getAddressSafe(tostring(mr.Address))
+                if type(a) == 'number' and a &gt; 0x10000 then
+                  cur = a
+                  okC = true
+                end
+              end)
+            end
+            local okV, v = nil, nil
+            if okC and type(cur) == 'number' and cur &gt; 0x10000 then
+              okV, v = pcall(readTyped, cur, tostring(mr.Type and mr.Type or ABF.typeName))
+            end
+            if okV and v ~= nil and math.abs(v - sv) &lt;= math.max(100, math.abs(sv) * 0.02) then
+              alive = alive + 1
+              if isCheck then
+                -- пережила рестарт прямо во время проверки — повышаем до чистого имени
+                pcall(function()
+                  mr.Description = 'Pointer Finder: ' .. d:sub(30)
+                  mr.Color = 0x000000
+                end)
+              end
+              log(fmt('[✓] previous record alive: "%s" -&gt; %s', d:sub(1, 60), tostring(v)))
+            else
+              stale = stale + 1
+              -- v2.02: протухшая запись НЕ удаляется — переименовывается и
+              -- остаётся в таблице: пользователь может проверить её сам,
+              -- если отвержение было ложным (просьба пользователя 2026-10-15).
+              pcall(function()
+                -- v2.04: суффикс пути — после префикса (длина зависит от имени)
+                local suffix = isCheck and d:sub(30) or d:sub(17)
+                mr.Description = 'Pointer Finder (WRONG?): ' .. suffix
+                mr.Color = 0x808080
+              end)
+              log(fmt('[!] previous record STALE (scene change / restart) — kept as WRONG?: "%s"',
+                d:sub(1, 60)))
+            end
+          end
+        end
+      end)
+      if alive + stale &gt; 0 then
+        log(fmt('[i] record audit: %d alive, %d stale', alive, stale))
+      end
+    end
+  end
+  ABF.dropped     = 0
+  ABF.errCount    = 0
+  ABF.strayHits   = 0
+  ABF.decodeFails = 0
+  ABF.hitCount    = 0
+  ABF.hwWarned    = false
+  ABF.hotAddrs    = {}
+  ABF.ripFlood    = {}
+  ABF.pairSeen    = {}
+  ABF.ripWatch    = {}
+  ABF.floodHits   = 0
+  ABF.recRefVal   = nil  -- v1.71: значение датчика на момент прошлого восстановления
+  ABF.lastTickAt  = nil  -- v1.86: когда датчик последний раз тикнул
+  ABF.lastBrHit   = 0    -- v1.86: время последнего РЕАЛЬНОГО хита ветки
+  ABF.burstRR     = 0    -- v1.88: круговой указатель очереди перевооружения
+  ABF.burstHitsAtStart = nil -- v1.90: access-хиты на старте бурста
+  ABF.rootSuspended = false -- v1.90: корневой watch снят на глубине
+  ABF.ripWatch   = {}   -- v1.91: RIP -&gt; watch-адрес (атрибуция flood-хитов)
+  ABF.lastPath    = nil
+  ABF.lastSeen    = nil
+  ABF.hitsAtCheck = 0
+  ABF.lastCheck   = 0
+  ABF.objBaseTried = false
+  ABF.triedRegBases = {}
+  ABF.lastCopySource = nil
+  ABF.copyReclimbAt = {}
+  ABF.lastCopyParent = nil
+  ABF.copyWalkFailRip = nil
+  ABF.directTried = {}
+  ABF.burstEnds = 0
+  ABF.nextBurstAt = 0
+  ABF.rspSeen = {}
+  ABF.regionDone = {}
+  ABF.branchLimitLogged = false
+  ABF.specGated = false
+  ABF.maxDepth = 0
+  if ABF.lblDepth ~= nil then ABF.lblDepth.Caption = 'Max depth: 0' end
+  ABF.btnAdd.Enabled = false
+
+  buildWritableMap()
+  log(fmt('[i] committed writable regions: %d', #ABF.writable))
+
+  ABF.rootAddr = addr
+  -- v1.63: выбор триггера убран из UI. Политика фиксируется кодом:
+  -- уровень 0 — ТОЛЬКО запись (классический «find what writes»: раз значение
+  -- в игре меняется, его кто-то пишет, и DR-брейкпоинт поймает этого писца
+  -- без пропусков). Все внутренние watchpoints — access (держатели цепочки
+  -- ЧИТАЮТСЯ каждый кадр, по записи они почти не меняются — уже так с v1.59).
+  -- Access на уровне 0 вреден: чтений значения в реальной игре на порядки
+  -- больше (HUD/логика), read-шум сжигает бюджет DR и гонит watch в чёрный
+  -- список, а burst-паузы на kind='write' не действуют.
+  if not addWatch(addr, 'write', valSize(tn), nil, bptWrite) then
+    setStatus('Failed to set a breakpoint at ' .. hex(addr))
+    return
+  end
+  ABF.level0Armed = true
+  ABF.running = true
+  ABF.lastProgress = now()  -- v1.97: отсчёт стагнации от Старта
+  ABF.btnStop.Enabled = true
+  local okl, bplist = pcall(debug_getBreakpointList)
+  if okl and type(bplist) == 'table' and #bplist &gt; 0 then
+    local first = bplist[1]
+    local firstStr = (type(first) == 'number') and hex(first) or tostring(first)
+    log(fmt('[i] active breakpoints in CE: %d (first %s)', #bplist, firstStr))
+    -- v1.39: чужие брейкпоинты занимают DR-слоты — при нехватке CE молча
+    -- деградирует в page-метод со штормом исключений.
+    -- v1.97: не снижаем свой лимит, а ЧИСТИМ ЧУЖИЕ. Все утечки — наши же
+    -- вatchpoints прошлых прогонов (лог 023153: 6 чужих bps -&gt; реальный
+    -- page-шторм 8 минут). Убираем — DR-регистры освобождаются полностью.
+    if #bplist &gt; ABF.watchCount then
+      -- v1.98: чужие записи (утечки прошлых прогонов) занимают DR и при 50+
+      -- полностью душат подачу хитов (лог 154605). 3-арг снимает при точном
+      -- совпадении size+trigger; для остальных — debug_removeBreakpointByID
+      -- (на Старт допустимо «ядерно»: после чистки корневый watch перевзводится).
+      -- ВАЖНО: pcall «успех» НЕ значит, что запись ушла (заглушка тоже
+      -- возвращает true) — считаем снятым только по факту, а верифицируем
+      -- одним перезапросом списка в конце.
+      local removed = 0
+      local usedById = false
+      for _, bpa in ipairs(bplist) do
+        if type(bpa) == 'number' and ABF.watches[bpa] == nil then
+          if pcall(debug_removeBreakpointByID, bpa) then
+            usedById = true
+            removed = removed + 1
+            if removed &lt;= 5 then
+              log(fmt('[i] removing leftover breakpoint at %X (from a previous run)', bpa))
+            end
+          end
+        end
+      end
+      if removed &gt; 5 then
+        log(fmt('[i] ... and %d more leftover breakpoint(s)', removed - 5))
+      end
+      local okl2, bplist2 = pcall(debug_getBreakpointList)
+      local left = (okl2 and type(bplist2) == 'table') and #bplist2 or nil
+      -- «ядерная» чистка могла снести и корневый watch — проверяем и перевзводим
+      local rootListed = false
+      if type(bplist2) == 'table' then
+        for _, bpa in ipairs(bplist2) do
+          if bpa == addr then rootListed = true break end
+        end
+      end
+      if usedById and (left == nil or not rootListed) and ABF.watches[addr] ~= nil then
+        ABF.watches[addr] = nil
+        ABF.watchCount = ABF.watchCount - 1
+        pcall(debug_setBreakpoint, addr, valSize(tn), bptWrite, bpmDebugRegister,
+          function(...) bpCallback(addr) end)
+        ABF.watches[addr] = { kind='write', size=valSize(tn), trig=bptWrite,
+          branches={}, hits=0, fails=0, t0=now(), rateN=0, rateT0=now() }
+        ABF.watchOrder[#ABF.watchOrder + 1] = addr
+        ABF.watchCount = ABF.watchCount + 1
+        log('[i] root watchpoint re-armed after the cleanup.')
+      end
+      if left == nil or left &lt;= ABF.watchCount then
+        ABF.MAX_WATCH = 3
+        log(fmt('[i] leftover breakpoints cleaned (%d removed) — watch limit 3 (VEH reserves one debug register)', removed))
+      else
+        ABF.lastGhostCount = left - ABF.watchCount
+        ABF.MAX_WATCH = 2
+        log(fmt('[!] %d stale breakpoint record(s) in CE survived the cleanup — CE serves breakpoints unreliably. Watch limit lowered to 2. If hits never appear, close the process in CE (computer icon) and attach again.', left - ABF.watchCount))
+      end
+    else
+      ABF.MAX_WATCH = 3
+    end
+  else
+    log('[!] WARNING: the CE breakpoint list is empty — the watchpoint was not set! '..
+      'Make sure the debugger is attached (debugProcess) and the memory is alive.')
+  end
+  setStatus('Level 0: change the currency (buy/pick up) or just enter rooms — any access to the object works.')
+  log('[=] level 0 watchpoint is set (write; inner levels — access). Trigger a value change in the game!')
+end
+
+--------------------------------------------------------------------- форма
+local function buildForm()
+  local form = createForm(false)
+  form.Caption = 'Pointer Finder'
+  form.Width  = 660
+  form.Height = 580
+  pcall(function() form.Position = 'poScreenCenter' end)
+
+  local lbl1 = createLabel(form)
+  lbl1.Left, lbl1.Top = 12, 66
+  lbl1.Caption = 'Value address (hex or module+offset):'
+
+  local edAddr = createEdit(form)
+  edAddr.Left, edAddr.Top, edAddr.Width = 12, 86, 300
+  edAddr.ShowHint = true
+  edAddr.Hint = 'Value address from the CE scan: hex or module+offset.\n'..
+    'Its current value will appear in the field on the right automatically.'
+
+  local lbl2 = createLabel(form)
+  lbl2.Left, lbl2.Top = 330, 66
+  lbl2.Caption = 'Current value (updates every second):'
+
+  -- v1.76 (переименовано из Expected value): текстовый лейбл, не поле ввода (значение
+  -- подтягивается само, вручную вводить нечего)
+  local edValue = createLabel(form)
+  edValue.Left, edValue.Top = 330, 88
+  edValue.Width = 160
+  edValue.ShowHint = true
+  edValue.Hint = 'Control: current value at the address (filled in automatically).\n'..
+    'Used to verify that the found chain leads to the target value.'
+
+  local lbl3 = createLabel(form)
+  lbl3.Left, lbl3.Top = 12, 12
+  lbl3.Caption = 'Value type:'
+
+  local cbType = createComboBox(form)
+  cbType.Left, cbType.Top, cbType.Width = 12, 32, 140
+  for _, nm in ipairs({ 'Byte', '2 Bytes', '4 Bytes', '8 Bytes', 'Float', 'Double', 'Custom' }) do
+    cbType.Items.add(nm)
+  end
+  cbType.ItemIndex = 2  -- 4 Bytes по умолчанию
+  -- v1.69: byte length for the Custom type
+  local lblCust = createLabel(form)
+  lblCust.Left, lblCust.Top = 170, 12
+  lblCust.Caption = 'Custom size (bytes):'
+  lblCust.Visible = false
+  local cbCust = createComboBox(form)
+  cbCust.Left, cbCust.Top, cbCust.Width = 170, 32, 60
+  for i = 1, 8 do cbCust.Items.add(tostring(i)) end
+  cbCust.ItemIndex = 3
+  cbCust.Visible = false
+  pcall(function() cbCust.Style = 'csDropDownList' end)
+  cbType.OnChange = function()
+    local isCustom = cbType.Items[cbType.ItemIndex] == 'Custom'
+    lblCust.Visible = isCustom
+    cbCust.Visible = isCustom
+  end
+  ABF.cbCust = cbCust
+  pcall(function() cbType.Style = 'csDropDownList' end)
+  cbType.ShowHint = true
+  cbType.Hint = 'Value type in the game (Double for most currencies).'
+
+  -- v1.63: комбобокс «Триггер уровня 0» удалён — режим фиксируется кодом
+  -- (write на уровне 0, access внутри), пользователю думать не нужно.
+  local btnStart = createButton(form)
+  btnStart.Left, btnStart.Top, btnStart.Width = 12, 122, 100
+  btnStart.Caption = 'Start'
+  btnStart.ShowHint = true
+  btnStart.Hint = 'Starts the search: sets a watchpoint on the address and automatically\n'..
+    'climbs the pointer chain up to a static address in the game module.'
+
+  local btnStop = createButton(form)
+  btnStop.Left, btnStop.Top, btnStop.Width = 120, 122, 100
+  btnStop.Caption = 'Stop'
+  btnStop.Enabled = false
+  btnStop.ShowHint = true
+  btnStop.Hint = 'Stops the search and removes all breakpoints (the game keeps running).'
+
+  local btnAdd = createButton(form)
+  btnAdd.Left, btnAdd.Top, btnAdd.Width = 230, 122, 280
+  btnAdd.Caption = 'Add the found address to Cheat Engine'
+  btnAdd.Enabled = false
+  btnAdd.ShowHint = true
+  btnAdd.Hint = 'Adds a ready-made Pointer record with the found chain to the CE address list.\n'..
+    'Called automatically after "BASE ADDRESS FOUND".\n'..
+    'Needed if the record was deleted from the table and must be restored without a new search.'
+
+  local lblStatus = createLabel(form)
+  lblStatus.Left, lblStatus.Top = 12, 158
+  lblStatus.Width = 636
+  lblStatus.Caption = 'Attach CE to the game, enter an address and press Start.'
+
+  -- v1.69: на отдельной строке и во всю ширину — длинный адрес объекта
+  -- иначе выезжает за край формы
+  local lblDepth = createLabel(form)
+  lblDepth.Left, lblDepth.Top = 12, 177
+  lblDepth.Width = 636
+  lblDepth.Caption = 'Max depth: 0'
+
+  local memo = createMemo(form)
+  memo.Left, memo.Top, memo.Width, memo.Height = 12, 196, 636, 336
+  pcall(function() memo.ReadOnly = true end)
+  pcall(function() memo.ScrollBars = 'ssAutoBoth' end)
+  memo.Lines.add(fmt('Pointer Finder %s — automatic base address finder.', ABF.VERSION))
+  memo.Lines.add('1) Attach CE to the game.')
+  memo.Lines.add('2) Enter the value address and press Start.')
+  memo.Lines.add('3) Keep playing and trigger value changes.')
+  memo.Lines.add('4) Wait for "BASE ADDRESS FOUND".')
+
+  form.OnClose = function()
+    stopAll(false)
+    return caHide or 1  -- прятать, а не уничтожать
+  end
+
+  btnStart.OnClick = function()
+    startSearch()
+  end
+  btnStop.OnClick = function()
+    stopAll(false)
+  end
+  btnAdd.OnClick = function()
+    local p = ABF.lastPath
+    if p == nil then
+      log('[!] nothing to add yet — find a path first')
+      return
+    end
+    -- v1.85: запись уже в таблице и резолвится — НЕ пересоздаём (кнопка
+    -- ранила живую запись: destroy+recreate, свежая не успевала вычислиться
+    -- в CE, и каскад «does not resolve → raw fallback» портил таблицу)
+    local descr = 'Pointer Finder: ' .. p.str
+    local existing = nil
+    pcall(function()
+      local al = getAddressList()
+      existing = al.getMemoryRecordByDescription(descr)
+      if existing == nil then
+        -- v2.04: запись сейчас на 120s-проверке — не создаём дубль
+        existing = al.getMemoryRecordByDescription('Pointer Finder (120s check): ' .. p.str)
+        if existing ~= nil then
+          log('[i] the record is currently under the 120s check — nothing to add.')
+        end
+      end
+    end)
+    if existing ~= nil then
+      local okA, ea = pcall(function() return getAddressSafe(existing.Address) end)
+      if okA and type(ea) == 'number' and ea &gt; 0x10000 then
+        log('[=] record is already in the table and resolves — nothing to do.')
+        toast('Record already in the table', 0x00FF00)
+        return
+      end
+    end
+    addPointerRecord(p.baseName, p.offsets, p.typeName, descr, p.obj)
+    log('[+] record re-added: ' .. p.str)
+  end
+
+  -- автоподтягивание значения: после ввода адреса читаем значение по адресу
+  -- (с выбранным типом) и кладём в поле «Ожидаемое значение». Детект изменения
+  -- адреса — опросом текста в таймере (не полагаемся на события CE), с
+  -- дебаунсом 400 мс после последнего символа.
+  local lastAddrText, lastAddrTextAt = nil, nil
+
+  local function parseAddrField()
+    local s = trim(ABF.edAddr.Text or '')
+    if s == '' then return nil end
+    if getOpenedProcessID() == 0 then return nil end
+    local addr = getAddressSafe(s)
+    if addr == nil then addr = tonumber(s, 16) end
+    if addr == nil or addr == 0 then return nil end
+    return addr
+  end
+
+  local function refreshValueField()
+    local addr = parseAddrField()
+    if addr == nil then return end
+    local tn = ABF.cbType.Items[ABF.cbType.ItemIndex]
+    if tn == nil then tn = 'Double' end
+    local okv, v = pcall(readTyped, addr, tn)
+    if okv and v ~= nil then
+      ABF.edValue.Caption = tostring(v)
+    end
+  end
+
+  local function addrRefreshTick()
+    local okT, s = pcall(function() return ABF.edAddr.Text end)
+    if not okT then return end
+    if s ~= lastAddrText then
+      lastAddrText = s
+      lastAddrTextAt = now()
+      return
+    end
+    if lastAddrTextAt == nil then return end
+    if now() - lastAddrTextAt &lt; 400 then return end
+    lastAddrTextAt = nil
+    refreshValueField()
+  end
+
+  local tm = createTimer(nil, false)
+  tm.Interval = 100
+  local uiTick = 0
+  tm.OnTimer = function()
+    pcall(processQueue)
+    pcall(addrRefreshTick)
+    -- v1.73: Current value обновляется каждую секунду, а не только при
+    -- правке адреса — значение в игре тикает само. Подписки на память в CE
+    -- нет; опрос 1 Гц в уже живом таймере стоит один readTyped.
+    uiTick = uiTick + 1
+    if uiTick &gt;= 10 then
+      uiTick = 0
+      pcall(refreshValueField)
+    end
+  end
+  tm.Enabled = true
+
+  ABF.form     = form
+  ABF.edAddr   = edAddr
+  ABF.edValue  = edValue
+  ABF.cbType   = cbType
+  ABF.btnStart = btnStart
+  ABF.btnStop  = btnStop
+  ABF.btnAdd   = btnAdd
+  ABF.status   = lblStatus
+  ABF.lblDepth = lblDepth
+  ABF.memo     = memo
+  ABF.timer    = tm
+end
+
+buildForm()
+ABF.form.show()
+
+-- v1.80: тосты (3 с) + звук; постоянный оверлей убран (в игре не было видно)
+do
+  local okT, errT = pcall(toastBuild)
+  if not okT then
+    pcall(log, '[!] toast window failed: ' .. tostring(errT))
+  end
+end
+
+-- v1.65: программный API для автотестов и внешнего драйвера (автономный
+-- прогон без ручного ввода). abfStart('8F839FE530') или
+-- abfStart('1BCFE4E29F0', 'Double').
+function abfStart(addrStr, typeName)
+  if ABF.edAddr == nil then return 'form not created' end
+  ABF.edAddr.Text = tostring(addrStr)
+  if typeName ~= nil then
+    pcall(function()
+      for i = 0, ABF.cbType.Items.Count - 1 do
+        if ABF.cbType.Items[i] == typeName then ABF.cbType.ItemIndex = i end
+      end
+    end)
+  end
+  local ok, err = pcall(startSearch)
+  if ok then return 'start: ' .. tostring(addrStr) end
+  return 'error: ' .. tostring(err)
+end
+
+function abfStatus()
+  if ABF.status == nil then return 'form not created' end
+  return tostring(ABF.status.Caption)
+end
+
+function abfStop()
+  local ok, err = pcall(stopAll, false)
+  return ok and 'stopped' or ('error: ' .. tostring(err))
+end
+]=]
+
+function abfReload()
+  stopOld()
+  local f, err = load(_G.__PointerFinderSrc, '=pointerfinder.lua')
+  if f == nil then
+    print('Pointer Finder: embedded source error: ' .. tostring(err))
+    return
+  end
+  f()
+  print('Pointer Finder: loaded (embedded build)')
+end
+
+abfReload()
+</LuaScript>
+</CheatTable>
