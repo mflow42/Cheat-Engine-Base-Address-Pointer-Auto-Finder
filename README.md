@@ -29,15 +29,15 @@ false lead) it recovers on its own instead of asking you to start over.
 
 ## Quick start
 
-1. Start your game and attach Cheat Engine to it.
-2. Open `PointerFinder.CT` in CE. The tool window appears. (To reload after
+1. Start your game.
+2. Open `PointerFinder.CT` - Cheat Engine and the Pointer Finder window appear. (To reload after
    an update without reopening CE: Lua Engine (Ctrl+Alt+L) → `abfReload()` → Execute.)
 
    ![Pointer Finder — tool window at startup](Screenshot05.png)
 
-3. Find your value with CE's scanner.
+3. Find your value with Cheat Engine's scanner.
 4. Paste the address you scanned to Pointer Finder.
-5. Choose data type (4 Bytes / Float / Double / etc.)
+5. Choose data type (2/4/8 Bytes / Float / Double / etc.)
 6. Press **Start**.
 7. Keep playing — trigger the value to change. **Rule of thumb: once every
    5–10 seconds is enough.** Rapid-fire changes add nothing: the tool needs
