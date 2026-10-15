@@ -32,6 +32,9 @@ false lead) it recovers on its own instead of asking you to start over.
 1. Start your game and attach Cheat Engine to it.
 2. Open `PointerFinder.CT` in CE. The tool window appears. (To reload after
    an update without reopening CE: Lua Engine (Ctrl+Alt+L) → `abfReload()` → Execute.)
+
+   ![Pointer Finder — tool window at startup](Screenshot05.png)
+
 3. Find your value with CE's scanner (Double for most currencies) and paste
    the address into the tool. Press **Start**.
 4. Keep playing — trigger the value to change. **Rule of thumb: once every
@@ -72,6 +75,10 @@ Type:        Double
 The tool self-verifies the record step by step (both the resolved address and
 the value) and prints the check into the log. A raw-address backup record is
 created only if your CE build fails to evaluate module expressions.
+
+Freezing works too: select the record and press Space — the address re-resolves
+through the pointer chain on every access, so the freeze survives garbage
+collection and reallocation, unlike freezing a raw address.
 
 **Logs** (handy when reporting an issue): every **Start** writes a fresh
 `pointerfinder_log_YYYY-MM-DD_HHMMSS.txt` into your `%TEMP%` folder — open it
