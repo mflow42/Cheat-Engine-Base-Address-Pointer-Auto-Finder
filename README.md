@@ -35,16 +35,18 @@ false lead) it recovers on its own instead of asking you to start over.
 
    ![Pointer Finder — tool window at startup](Screenshot05.png)
 
-3. Find your value with CE's scanner (Double for most currencies) and paste
-   the address into the tool. Press **Start**.
-4. Keep playing — trigger the value to change. **Rule of thumb: once every
+3. Find your value with CE's scanner.
+4. Paste the address you scanned to Pointer Finder.
+5. Choose data type (4 Bytes / Float / Double / etc.)
+6. Press **Start**.
+7. Keep playing — trigger the value to change. **Rule of thumb: once every
    5–10 seconds is enough.** Rapid-fire changes add nothing: the tool needs
    only a tick to climb or to verify a candidate, and a brief pause between
    changes lets the value settle before verification reads it. In fact, a
    good strategy is to **trigger the change once and just keep waiting** —
    the tool usually climbs the whole chain and verifies the pointer on its
    own, no extra triggers required.
-5. Wait for `BASE ADDRESS FOUND`. The pointer record is added to the address
+8. Wait for `BASE ADDRESS FOUND`. The pointer record is added to the address
    list immediately as `Pointer Finder (120s check): …` — during the first
    two minutes the tool re-checks the chain against the live value; when it
    holds, the record is renamed to the final `Pointer Finder: …` (black).
