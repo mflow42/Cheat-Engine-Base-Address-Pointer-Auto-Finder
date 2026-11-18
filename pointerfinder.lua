@@ -1,5 +1,5 @@
 --============================================================================
--- Pointer Finder v2.10 (scan-walk) for Cheat Engine 7.4+ (incl. 7.7), x64 games —
+-- Pointer Finder v2.11 (scan-walk) for Cheat Engine 7.4+ (incl. 7.7), x64 games —
 -- part of the 'Cheat Engine Base Address Pointer Auto Finder' project.
 -- Код грузится загрузчиком из CT (abfReload) — обновляется без переоткрытия CE
 --
@@ -30,7 +30,7 @@ ABF = {}
 _G.__PointerFinder = ABF
 
 ------------------------------------------------------------------ настройки
-ABF.VERSION        = '2.10' -- версия для заставки и диагностики
+ABF.VERSION        = '2.11' -- версия для заставки и диагностики
 ABF.MAX_DEPTH      = 8      -- максимум оффсетов в цепочке
 ABF.MAX_WATCH      = 3      -- только debug-регистры (page-метод роняет игры).
                             -- v1.99: было 4, но VEH держит один DR под степпинг —
@@ -57,6 +57,11 @@ ABF.FLOOD_WINDOW_MS = 1000  -- RIP за окно — остальные дроп
 ABF.PAIR_TTL_MS    = 30000  -- дедуп: пара (адрес,RIP) не обрабатывается повторно
 ABF.FLOOD_LOG_MS   = 5000   -- как часто логировать подавленный шторм
 ABF.SPEC_TTL_MS    = 8000   -- спекулятивный держатель без хитов столько мс - освобождает слот
+ABF.REAP_TICKS     = 3      -- v2.11: жнец срабатывает после стольких ТИКОВ значения
+                            -- без единого хита (держатели статических веток читаются
+                            -- редко - при смене сцен; время - плохая мера терпения)
+ABF.GRACE_MAX      = 3      -- v2.11: максимум продлений recovery для незрелых
+                            -- статических веток (по одному на 60 с тишины веток)
 ABF.STAG_MS        = 180000 -- v1.97: столько мс без единого открытия, пока хиты текут,
                             -- — поиск застрял (page-шторм): перезапуск через fresh-scan
 ABF.PAGE_STORM_N   = 300    -- v1.97: «соседних» page-хитов на одну страницу за окно —
@@ -724,7 +729,7 @@ local function addWatch(addr, kind, size, branch, trigger)
     return false
   end
   w = { kind=kind, size=size, trig=trig, branches={}, hits=0, fails=0,
-        t0=now(), rateN=0, rateT0=now() }
+        t0=now(), rateN=0, rateT0=now(), tick0=(ABF.tickSeq or 0) }
   if branch ~= nil then w.branches[branch] = true end
   ABF.watches[addr] = w
   insert(ABF.watchOrder, addr)
@@ -1029,11 +1034,27 @@ local function armPendingLiveCandidates(maxArmed)
     end
   end
   ABF.pendingCands = nil
+  -- v2.11: НЕстековые кандидаты первыми. Стековые копии (уровень 0) —
+  -- тупиковые ветки: указателей на стековую ячейку нет, watch тратит слот,
+  -- а его хиты (mov [rsp+A0],rsi) питают ложный «hits keep flowing».
+  -- Serpent Gaze 013052: из 41 живого кандидата 39 были стековыми.
+  local stable = {}
   for _, ad in ipairs(alive) do
+    if not isStackish(ad) then
+      stable[#stable + 1] = ad
+    end
+  end
+  for _, ad in ipairs(alive) do
+    if isStackish(ad) then
+      stable[#stable + 1] = ad
+    end
+  end
+  for _, ad in ipairs(stable) do
     if armed < maxArmed then
       if addWatch(ad, 'write', valSize(ABF.typeName), nil, nil) then
         armed = armed + 1
-        log(fmt('[i] live candidate %X — watchpoint (write, level-0 path) set', ad))
+        log(fmt('[i] live candidate %X — watchpoint (write, level-0 path) set%s',
+          ad, isStackish(ad) and ' (stack copy — last resort)' or ''))
       end
     end
   end
@@ -2410,6 +2431,7 @@ local function processHit(ev)
           w.hits = w.hits + 1
           for br in pairs(w.branches) do br.lastHit = tnow end
           ABF.lastBrHit = tnow  -- v1.86: РЕАЛЬНЫЙ хит ветки (не время создания/GC)
+          ABF.recoveryGrace = 0  -- v2.11: ветка жива — grace-продления recovery сброс
           ABF.ripWatch[ev.rip] = m.addr  -- v1.91: атрибуция flood-подавленных
           -- v1.70: дедуп пар (адрес,RIP). В горячем цикле та же инструкция
           -- читает тот же держатель тысячи раз — повторный подъём не даёт
@@ -2778,13 +2800,32 @@ local function processQueue()
       -- через fresh-scan (скан сразу после следующего тика значения).
       -- лимбо: не validation, не fresh-scan, а watch и веток НЕТ — поиск
       -- крутится вхолостую (после STALE-перезапуска датчик мёртв, хиты ушли)
+      -- v2.11: незрелые статические ветки НЕ повод для stuck-перезапуска:
+      -- «hits keep flowing» считают и бессмысленные стековые хиты копий
+      -- (mov [rsp+A0],rsi в Serpent Gaze), а статические держатели просто
+      -- ждут смены сцены. Стирать их = потерять лестницу и уйти в цикл
+      -- fresh-scan по стеку. При незрелости stuck-гейт пропускается.
       local limbo = ABF.validating == nil and ABF.resync == nil
         and ABF.pendingCands == nil and ABF.watchCount == 0
         and #ABF.branches == 0
         and t - (ABF.lastProgress or 0) > 60000
+      local swUnhit, swUnarmed = 0, 0
+      if #ABF.branches > 0 then
+        for _, br in ipairs(ABF.branches) do
+          for _, wa in ipairs(br.watchAddrs or {}) do
+            local w2 = ABF.watches[wa]
+            if w2 == nil then
+              swUnarmed = swUnarmed + 1
+            elseif w2.kind ~= 'write' and (w2.hits or 0) == 0 then
+              swUnhit = swUnhit + 1
+            end
+          end
+        end
+      end
+      local swImmature = (swUnhit > 0 or swUnarmed > 0) and #ABF.branches > 0
       if (ABF.validating == nil and ABF.resync == nil
           and ABF.lastProgress > 0 and t - ABF.lastProgress > ABF.STAG_MS
-          and not noHits) or limbo then
+          and not noHits and not swImmature) or limbo then
         local totalHits = ABF.hitCount + (ABF.floodHits or 0)
         log(fmt('[!] no discovery for %d min while hits keep flowing (%d total) — '..
           'the search is stuck. Restarting via fresh-scan.',
@@ -2794,23 +2835,33 @@ local function processQueue()
         ABF.lastProgress = t
         startResync('search restarted: the scheduler will rescan right after the next value change.')
       end
-      -- v1.68: ЖНЕЦ — access-watch без единого хита за SPEC_TTL_MS освобождает
-      -- DR-слот. Мусорные ячейки-держатели от старых поколений GC иначе занимают
+      -- v1.68: ЖНЕЦ — access-watch без единого хита освобождает DR-слот.
+      -- Мусорные ячейки-держатели от старых поколений GC иначе занимают
       -- слоты вечно и душат подъём (подтверждённые хитами не трогаются).
+      -- v2.11: мера терпения — ТИКИ значения, а не время. Держатели
+      -- статических (scan-walk) веток читаются редко: при смене сцен и
+      -- перерисовке HUD. В Serpent Gaze жнец убивал их за 8 с — за 8 секунд
+      -- в спокойной игре значение может не тикнуть ни разу, и вся статическая
+      -- лестница умирала до первого шанса. Теперь: 3 тика значения без
+      -- единого хита — мусор; меньше — ветка ждёт своего события.
       do
         local reaped = {}
         for addr, w in pairs(ABF.watches) do
-          if w.kind == 'access' and w.hits == 0 and next(w.branches) ~= nil
-              and t - (w.t0 or 0) > ABF.SPEC_TTL_MS then
-            reaped[#reaped + 1] = addr
+          if w.kind == 'access' and w.hits == 0 and next(w.branches) ~= nil then
+            local tickAge = ABF.tickSeq - (w.tick0 or 0)
+            local timeAge = t - (w.t0 or 0)
+            if tickAge >= ABF.REAP_TICKS
+                or (timeAge > 60000 and ABF.tickSeq == (w.tick0 or 0)) then
+              reaped[#reaped + 1] = addr
+            end
           end
         end
         for _, addr in ipairs(reaped) do
           -- v1.91: БЕЗ чёрного списка — декод-мусор делал живые ячейки
           -- «нуль-хитовыми», blacklist на 60 с выкидывал их из ротации
           removeWatch(addr)
-          log(fmt('[-] speculative holder %X: no hits in %d s — slot released',
-            addr, ABF.SPEC_TTL_MS / 1000))
+          log(fmt('[-] speculative holder %X: no hits after %d value ticks — slot released',
+            addr, ABF.REAP_TICKS))
         end
         -- v1.87: ЖНЕЦ СИРОТ — access-watch без единой живой ветки не служит
         -- ничему, но занимает DR-слот (хиты у него есть, обычный жнец не
@@ -3111,43 +3162,82 @@ local function processQueue()
           elseif math.abs(rv2 - ABF.recRefVal) >= 0.5 then
             ABF.recRefVal = rv2
             ABF.lastTickAt = t
+            ABF.tickSeq = (ABF.tickSeq or 0) + 1
           end
         end
         if ABF.lastTickAt ~= nil and t - ABF.lastTickAt < 60000
             and t - (ABF.lastBrHit or 0) >= 60000
             and t - (ABF.lastRearm or 0) > 30000 then
-        -- v1.61: уровни умерли (GC) или адрес был мёртв изначально.
-        -- Предохранитель: 3 сброса подряд без единого хита — честно признаём
-        -- адрес мёртвым.
-        ABF.lastRearm = t
-        ABF.rearmCount = (ABF.rearmCount or 0) + 1
-        if ABF.rearmCount > 3 then
-          if not ABF.deadAddrLogged then
-            ABF.deadAddrLogged = true
-            log('[!] 3 recoveries without a single hit — the entered address looks '..
-              'dead (stack/freed memory/wrong value). Do a fresh scan '..
-              'RIGHT AFTER the value changes and enter a new address.')
-            if (ABF.lastGhostCount or 0) > 0 then
-              log(fmt('[!] NOTE: %d stale CE breakpoint record(s) were present at Start — '..
-                'CE serves breakpoints unreliably in this state. Close the process in CE '..
-                '(computer icon) and attach again, then Start once more.',
-                ABF.lastGhostCount))
+          ABF.lastRearm = t
+          -- v2.11: GRACE для незрелых СТАТИЧЕСКИХ веток. Scan-walk держатели
+          -- читаются редко (смена сцен, перерисовка HUD), их 60-с тишина —
+          -- не смерть ветки. Serpent Gaze 011925: recovery стирал свежие
+          -- статические лестницы (уровни 2-3 стояли 8-60 с) и поиск
+          -- вырождался в бесконечный fresh-scan по стековым копиям.
+          -- Незрелость = access-watch с нулём хитов или невооружённые адреса
+          -- в очереди веток; максимум GRACE_MAX продлений (по одному на 60 с),
+          -- затем обычный wipe.
+          local unhit, unarmed = 0, 0
+          for _, br in ipairs(ABF.branches) do
+            for _, wa in ipairs(br.watchAddrs or {}) do
+              local w2 = ABF.watches[wa]
+              if w2 == nil then
+                unarmed = unarmed + 1
+              elseif w2.kind ~= 'write' and (w2.hits or 0) == 0 then
+                unhit = unhit + 1
+              end
             end
           end
-        else
-          log(fmt('[i] value ticking but no branch hits for 60 s (self-recovery %d/3) — re-searching live copies...',
-            ABF.rearmCount))
-          ABF.branches = {}
-          removeAllWatches()
-          local collected = collectLiveCandidates()
-          if collected > 0 then
-            log(fmt('[i] collected %d candidates — the watchdog will verify liveness by the money tick.', collected))
+          if (unhit > 0 or unarmed > 0) and #ABF.branches > 0
+              and (ABF.recoveryGrace or 0) < ABF.GRACE_MAX then
+            if t - (ABF.graceAt or 0) >= 60000 then
+              ABF.graceAt = t
+              ABF.recoveryGrace = (ABF.recoveryGrace or 0) + 1
+            end
+            ABF.nextBurstAt = 0  -- форс-бурст: слоты отдадим очереди статических веток
+            if t - (ABF.graceLogAt or 0) > 60000 then
+              ABF.graceLogAt = t
+              log(fmt('[i] branches quiet 60+ s, but %d static holder(s) are unhit/unarmed - grace %d/%d, waiting for scene changes...',
+                unhit + unarmed, ABF.recoveryGrace or 0, ABF.GRACE_MAX))
+            end
           else
-            -- v1.62: пусто → режим свежего скана вместо ручного повтора
-            startResync('no copies with this value (the value changed since it was read).')
+            if unhit > 0 or unarmed > 0 then
+              log('[i] static branches never got hits within their grace period - falling back to fresh-scan.')
+            end
+            ABF.recoveryGrace = 0
+            ABF.graceAt = nil
+            -- v1.61: уровни умерли (GC) или адрес был мёртв изначально.
+            -- Предохранитель: 3 сброса подряд без единого хита — честно
+            -- признаём адрес мёртвым.
+            ABF.rearmCount = (ABF.rearmCount or 0) + 1
+            if ABF.rearmCount > 3 then
+              if not ABF.deadAddrLogged then
+                ABF.deadAddrLogged = true
+                log('[!] 3 recoveries without a single hit — the entered address looks '..
+                  'dead (stack/freed memory/wrong value). Do a fresh scan '..
+                  'RIGHT AFTER the value changes and enter a new address.')
+                if (ABF.lastGhostCount or 0) > 0 then
+                  log(fmt('[!] NOTE: %d stale CE breakpoint record(s) were present at Start — '..
+                    'CE serves breakpoints unreliably in this state. Close the process in CE '..
+                    '(computer icon) and attach again, then Start once more.',
+                    ABF.lastGhostCount))
+                end
+              end
+            else
+              log(fmt('[i] value ticking but no branch hits for 60 s (self-recovery %d/3) — re-searching live copies...',
+                ABF.rearmCount))
+              ABF.branches = {}
+              removeAllWatches()
+              local collected = collectLiveCandidates()
+              if collected > 0 then
+                log(fmt('[i] collected %d candidates — the watchdog will verify liveness by the money tick.', collected))
+              else
+                -- v1.62: пусто → режим свежего скана вместо ручного повтора
+                startResync('no copies with this value (the value changed since it was read).')
+              end
+            end
           end
         end
-      end
       -- v1.84/v1.86: тихая подсказка — значение НЕ тикает 60+ с (игрок
       -- забыл триггерить) ИЛИ тикает, но ветки молчат: смена активности
       -- полезнее повторных триггеров (держатели читаются разной логикой).
@@ -3261,6 +3351,12 @@ local function startSearch()
   ABF.lastRearm = now()
   ABF.recRefVal = nil
   ABF.rearmCount = 0
+  -- v2.11: терпение по тикам — новые счётчики в чистое состояние
+  ABF.tickSeq = 0
+  ABF.uiLastVal = nil
+  ABF.recoveryGrace = 0
+  ABF.graceAt = nil
+  ABF.graceLogAt = nil
   ABF.lastGhostCount = nil
   ABF.pendingExt = 0
   ABF.serveWarned = nil
@@ -3409,6 +3505,12 @@ local function startSearch()
   ABF.branchLimitLogged = false
   ABF.specGated = false
   ABF.maxDepth = 0
+  -- v2.11: терпение по тикам — счётчики в чистое состояние
+  ABF.tickSeq = 0
+  ABF.uiLastVal = nil
+  ABF.recoveryGrace = 0
+  ABF.graceAt = nil
+  ABF.graceLogAt = nil
   if ABF.lblDepth ~= nil then ABF.lblDepth.Caption = 'Max depth: 0' end
   ABF.btnAdd.Enabled = false
 
@@ -3683,6 +3785,14 @@ local function buildForm()
     local okv, v = pcall(readTyped, addr, tn)
     if okv and v ~= nil then
       ABF.edValue.Caption = tostring(v)
+      -- v2.11: счётчик ТИКОВ значения (жнец/recovery меряют терпение тиками,
+      -- не временем - держатели статических веток читаются только при смене
+      -- сцен). Опрос 1 Гц уже был; сравнение с прошлым значением бесплатно.
+      if ABF.running and ABF.rootAddr ~= nil
+          and math.abs(v - (ABF.uiLastVal or v)) >= 0.5 then
+        ABF.uiLastVal = v
+        ABF.tickSeq = (ABF.tickSeq or 0) + 1
+      end
     end
   end
 
