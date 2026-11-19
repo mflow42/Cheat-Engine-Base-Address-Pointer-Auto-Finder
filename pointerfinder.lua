@@ -1,5 +1,5 @@
 --============================================================================
--- Pointer Finder v2.13 (scan-walk) for Cheat Engine 7.4+ (incl. 7.7), x64 games —
+-- Pointer Finder v2.14 (scan-walk) for Cheat Engine 7.4+ (incl. 7.7), x64 games —
 -- part of the 'Cheat Engine Base Address Pointer Auto Finder' project.
 -- Код грузится загрузчиком из CT (abfReload) — обновляется без переоткрытия CE
 --
@@ -30,7 +30,7 @@ ABF = {}
 _G.__PointerFinder = ABF
 
 ------------------------------------------------------------------ настройки
-ABF.VERSION        = '2.13' -- версия для заставки и диагностики
+ABF.VERSION        = '2.14' -- версия для заставки и диагностики
 ABF.MAX_DEPTH      = 30     -- максимум оффсетов в цепочке (UE-цепи бывают до 10:
                             -- GUObjectArray -> UObject -> Outer -> ...; Serpent
                             -- Gaze упирался в 8 и резал живой путь)
@@ -3388,14 +3388,18 @@ local function startSearch()
   ABF.lastGhostCount = nil
   ABF.pendingExt = 0
   ABF.serveWarned = nil
-  -- v2.13: лимит глубины с экрана (3-64; дефолт 30). Клампится, мусорный
-  -- ввод молча даёт дефолт.
+  -- v2.14: лимит глубины с экрана (3-999; дефолт 30). Ввод вне диапазона
+  -- честно клампится с сообщением в лог (Serpent Gaze 144226: пользователь
+  -- ввёл 100 при потолке 64 - «поле не работает», на деле silent-кламп).
   do
     local lim = tonumber(ABF.edDepth ~= nil and ABF.edDepth.Text or '')
-    if lim ~= nil and lim >= 3 and lim <= 64 then
+    if lim ~= nil and lim >= 3 and lim <= 999 then
       ABF.MAX_DEPTH = math.floor(lim)
     else
       ABF.MAX_DEPTH = 30
+      if lim ~= nil then
+        log(fmt('[i] depth limit %s out of range 3-999 - using default 30', tostring(lim)))
+      end
     end
     log(fmt('[i] depth limit: %d', ABF.MAX_DEPTH))
   end
@@ -3776,7 +3780,7 @@ local function buildForm()
   edDepth.Left, edDepth.Top, edDepth.Width = 92, 173, 50
   edDepth.Text = '30'
   edDepth.ShowHint = true
-  edDepth.Hint = 'Max pointer hops to climb (3-64). Default 30 is enough for UE games;\n'..
+  edDepth.Hint = 'Max pointer hops to climb (3-999). Default 30 is enough for UE games;\n'..
     'longer chains are almost always interior ladders (garbage).'
   ABF.edDepth = edDepth
 
