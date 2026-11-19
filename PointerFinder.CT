@@ -3,7 +3,7 @@
   <CheatEntries>
   </CheatEntries>
   <UserdefinedSymbols/>
-  <LuaScript>-- Pointer Finder v2.17 — Cheat Engine table.
+  <LuaScript>-- Pointer Finder v2.18 — Cheat Engine table.
 -- The tool code is embedded; this single file is the whole
 -- distribution. Update without reopening CE:
 --   Ctrl+Alt+L (Lua Engine) -&gt; abfReload() -&gt; Execute.
@@ -21,7 +21,7 @@ local function stopOld()
 end
 __PointerFinderSrc = [=[
 --============================================================================
--- Pointer Finder v2.17 (scan-walk) for Cheat Engine 7.4+ (incl. 7.7), x64 games —
+-- Pointer Finder v2.18 (scan-walk) for Cheat Engine 7.4+ (incl. 7.7), x64 games —
 -- part of the 'Cheat Engine Base Address Pointer Auto Finder' project.
 -- Код грузится загрузчиком из CT (abfReload) — обновляется без переоткрытия CE
 --
@@ -52,7 +52,7 @@ ABF = {}
 _G.__PointerFinder = ABF
 
 ------------------------------------------------------------------ настройки
-ABF.VERSION        = '2.17' -- версия для заставки и диагностики
+ABF.VERSION        = '2.18' -- версия для заставки и диагностики
 ABF.MAX_DEPTH      = 30     -- максимум оффсетов в цепочке (UE-цепи бывают до 10:
                             -- GUObjectArray -&gt; UObject -&gt; Outer -&gt; ...; Serpent
                             -- Gaze упирался в 8 и резал живой путь)
@@ -64,7 +64,7 @@ ABF.MAX_WATCH      = 3      -- только debug-регистры (page-мет�
 ABF.MAX_HOLDERS    = 3      -- держателей указателя на один объект
 ABF.MAX_BRANCHES   = 64     -- одновременных веток подъёма
 ABF.WALK_BACK      = 6      -- сколько инструкций назад разбирать при копии
-ABF.WALK_SCAN      = 96     -- окно поиска назад от RIP, байт
+ABF.WALK_SCAN      = 512     -- окно поиска назад от RIP, байт
 ABF.QUEUE_MAX      = 128    -- предел очереди хитов
 ABF.BRANCH_IDLE_MS = 180000 -- ветка без хитов столько мс закрывается (должна переживать паузы между изменениями денег)
 ABF.PROC_PER_TICK  = 24     -- хитов на тик таймера
@@ -885,7 +885,17 @@ local function newBranch(obj, offsets)
   return br
 end
 
+-- v2.18: БЮДЖЕТ ВРЕМЕНИ ТИКА. AOBScan'ы непрерываемы: один скан может занять
+-- секунды в большой игре (Serpent Gaze: 14k writable-регионов), и всё это
+-- время GUI CE заморожен - «Стоп» не нажимается, «Current value» не тикает
+-- (репорты пользователя 18:0x). Бюджет не прерывает уже начатый скан, но
+-- НЕ НАЧИНАЕТ новый после дедлайна: между сканами UI получает управление.
+local function tickBudgetOver()
+  return ABF.tickDeadline ~= nil and now() &gt; ABF.tickDeadline
+end
+
 local function scanHolders(objAddr)
+  if tickBudgetOver() then return {} end
   local pat = {}
   for i = 0, 7 do
     insert(pat, fmt('%02X', (objAddr &gt;&gt; (8 * i)) &amp; 0xFF))
@@ -920,6 +930,7 @@ end
 -- Возвращает список { { P, disp }, ... }, отсортированный по disp (меньший
 -- офсет вероятнее — начало структуры).
 local function scanNearPointer(H)
+  if tickBudgetOver() then return {} end
   local out = {}
   local b = {}
   for i = 0, 7 do
@@ -1002,6 +1013,7 @@ end
 -- «прочитали значение → тик денег → скан нашёл только освобождённые
 -- ячейки со старым значением». Возвращает число собранных кандидатов.
 local function collectLiveCandidates()
+  if tickBudgetOver() then return 0 end
   local okV, val = pcall(readTyped, ABF.rootAddr, ABF.typeName)
   local n = 0
   if not okV or val == nil then return 0 end
@@ -2749,6 +2761,9 @@ local function processQueue()
     ABF.queue = {}
     return
   end
+  -- v2.18: дедлайн тика - тяжёлые сканы начинаются, только пока не истёк;
+  -- между сканами UI дышит (Стоп/Current value отзывчивы)
+  ABF.tickDeadline = now() + 250
   local n = 0
   while #ABF.queue &gt; 0 and n &lt; ABF.PROC_PER_TICK do
     local ev = remove(ABF.queue, 1)
@@ -3995,6 +4010,8 @@ local function buildForm()
   tm.Interval = 100
   local uiTick = 0
   tm.OnTimer = function()
+    -- v2.18: Current value ПЕРВЫМ - обновляется даже после долгого тика поиска
+    pcall(refreshValueField)
     pcall(processQueue)
     pcall(addrRefreshTick)
     -- v1.73: Current value обновляется каждую секунду, а не только при
@@ -4003,7 +4020,6 @@ local function buildForm()
     uiTick = uiTick + 1
     if uiTick &gt;= 10 then
       uiTick = 0
-      pcall(refreshValueField)
     end
   end
   tm.Enabled = true
