@@ -3,7 +3,7 @@
   <CheatEntries>
   </CheatEntries>
   <UserdefinedSymbols/>
-  <LuaScript>-- Pointer Finder v2.15 — Cheat Engine table.
+  <LuaScript>-- Pointer Finder v2.16 — Cheat Engine table.
 -- The tool code is embedded; this single file is the whole
 -- distribution. Update without reopening CE:
 --   Ctrl+Alt+L (Lua Engine) -&gt; abfReload() -&gt; Execute.
@@ -21,7 +21,7 @@ local function stopOld()
 end
 __PointerFinderSrc = [=[
 --============================================================================
--- Pointer Finder v2.15 (scan-walk) for Cheat Engine 7.4+ (incl. 7.7), x64 games —
+-- Pointer Finder v2.16 (scan-walk) for Cheat Engine 7.4+ (incl. 7.7), x64 games —
 -- part of the 'Cheat Engine Base Address Pointer Auto Finder' project.
 -- Код грузится загрузчиком из CT (abfReload) — обновляется без переоткрытия CE
 --
@@ -52,7 +52,7 @@ ABF = {}
 _G.__PointerFinder = ABF
 
 ------------------------------------------------------------------ настройки
-ABF.VERSION        = '2.15' -- версия для заставки и диагностики
+ABF.VERSION        = '2.16' -- версия для заставки и диагностики
 ABF.MAX_DEPTH      = 30     -- максимум оффсетов в цепочке (UE-цепи бывают до 10:
                             -- GUObjectArray -&gt; UObject -&gt; Outer -&gt; ...; Serpent
                             -- Gaze упирался в 8 и резал живой путь)
@@ -64,7 +64,7 @@ ABF.MAX_WATCH      = 3      -- только debug-регистры (page-мет�
 ABF.MAX_HOLDERS    = 3      -- держателей указателя на один объект
 ABF.MAX_BRANCHES   = 64     -- одновременных веток подъёма
 ABF.WALK_BACK      = 6      -- сколько инструкций назад разбирать при копии
-ABF.WALK_SCAN      = 24     -- окно поиска назад от RIP, байт
+ABF.WALK_SCAN      = 96     -- окно поиска назад от RIP, байт
 ABF.QUEUE_MAX      = 128    -- предел очереди хитов
 ABF.BRANCH_IDLE_MS = 180000 -- ветка без хитов столько мс закрывается (должна переживать паузы между изменениями денег)
 ABF.PROC_PER_TICK  = 24     -- хитов на тик таймера
@@ -1775,9 +1775,16 @@ climb = function(state)
       for _, cand in ipairs(parents) do
         if walkStarted &gt;= 6 then break end
         local P, disp = cand[1], cand[2]
-        -- v2.01: стековых «родителей» отсекаем до climb — они жгли бюджет
-        -- сканов (010403: +28/+38/+48/+58 — все кадры стека)
-        if isStackish(P) then
+        -- v2.16: самоссылка (родитель == сам держатель, disp 0) — мусор:
+        -- указатель сам на себя подъёма не даёт, ветки только раздувал
+        -- (Serpent Gaze 162925: уровни 5-9 - цепочка «interior to SAME (+0)»,
+        -- 301 пустой держатель съели весь grace).
+        if P == H then
+          if walkLogN &lt;= 6 then
+            log(fmt('[-] scan-walk: %X points at itself (+0) - self-reference, skipped', H))
+            walkLogN = walkLogN + 1
+          end
+        elseif isStackish(P) then
           if walkLogN &lt;= 6 then
             log(fmt('[-] scan-walk: parent %X of %X looks like stack — skipped', P, H))
             walkLogN = walkLogN + 1
@@ -1810,7 +1817,7 @@ climb = function(state)
   if depth &gt; ABF.maxDepth then
     ABF.maxDepth = depth
     if ABF.lblDepth ~= nil then
-      ABF.lblDepth.Caption = fmt('Max depth: %d (object %X)', depth, obj)
+      ABF.lblDepth.Caption = fmt('Max depth reached: %d (object %X)', depth, obj)
     end
   end
   toast(fmt('Depth %d — keep playing', depth), 0x00FFFF, 700)  -- жёлтый
@@ -2931,15 +2938,21 @@ local function processQueue()
         end
       end
       local swImmature = (swUnhit &gt; 0 or swUnarmed &gt; 0) and #ABF.branches &gt; 0
+      -- v2.16: «hits keep flowing» требует ПОТОКА: меньше 30 хитов за окно
+      -- стагнации - это тишина, не шторм. Serpent Gaze 162925: гейт сработал
+      -- на 6 хитах и стёр поиск сразу после recovery.
+      local hitsSinceProgress = ABF.hitCount - (ABF.progressHits or 0)
       if (ABF.validating == nil and ABF.resync == nil
           and ABF.lastProgress &gt; 0 and t - ABF.lastProgress &gt; ABF.STAG_MS
-          and not noHits and not swImmature) or limbo then
+          and not noHits and not swImmature
+          and hitsSinceProgress &gt;= 30) or limbo then
         local totalHits = ABF.hitCount + (ABF.floodHits or 0)
-        log(fmt('[!] no discovery for %d min while hits keep flowing (%d total) — '..
+        log(fmt('[!] no discovery for %d min while %d hit(s) kept flowing (%d total) — '..
           'the search is stuck. Restarting via fresh-scan.',
-          ABF.STAG_MS // 60000, totalHits))
+          ABF.STAG_MS // 60000, hitsSinceProgress, totalHits))
         removeAllWatches()
         ABF.branches = {}
+        ABF.progressHits = ABF.hitCount
         ABF.lastProgress = t
         startResync('search restarted: the scheduler will rescan right after the next value change.')
       end
@@ -3642,6 +3655,7 @@ local function startSearch()
   ABF.copyWalkFailRip = nil
   ABF.directTried = {}
   ABF.srcSeen = {}  -- v2.15: обработанные пары (писец, источник) — дедуп спама
+  ABF.progressHits = 0  -- v2.16: baseline хитов для stuck-гейта
   ABF.burstEnds = 0
   ABF.nextBurstAt = 0
   ABF.rspSeen = {}
