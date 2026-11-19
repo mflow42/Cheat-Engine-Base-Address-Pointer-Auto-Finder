@@ -3,7 +3,7 @@
   <CheatEntries>
   </CheatEntries>
   <UserdefinedSymbols/>
-  <LuaScript>-- Pointer Finder v2.19.1 — Cheat Engine table.
+  <LuaScript>-- Pointer Finder v2.20 — Cheat Engine table.
 -- The tool code is embedded; this single file is the whole
 -- distribution. Update without reopening CE:
 --   Ctrl+Alt+L (Lua Engine) -&gt; abfReload() -&gt; Execute.
@@ -21,7 +21,7 @@ local function stopOld()
 end
 __PointerFinderSrc = [=[
 --============================================================================
--- Pointer Finder v2.19.1 (scan-walk) for Cheat Engine 7.4+ (incl. 7.7), x64 games —
+-- Pointer Finder v2.20 (scan-walk) for Cheat Engine 7.4+ (incl. 7.7), x64 games —
 -- part of the 'Cheat Engine Base Address Pointer Auto Finder' project.
 -- Код грузится загрузчиком из CT (abfReload) — обновляется без переоткрытия CE
 --
@@ -52,7 +52,7 @@ ABF = {}
 _G.__PointerFinder = ABF
 
 ------------------------------------------------------------------ настройки
-ABF.VERSION        = '2.19.1' -- версия для заставки и диагностики
+ABF.VERSION        = '2.20' -- версия для заставки и диагностики
 ABF.MAX_DEPTH      = 30     -- максимум оффсетов в цепочке (UE-цепи бывают до 10:
                             -- GUObjectArray -&gt; UObject -&gt; Outer -&gt; ...; Serpent
                             -- Gaze упирался в 8 и резал живой путь)
@@ -522,8 +522,11 @@ end
 -- Serpent Gaze 171552/215940: между «mov ecx,eax» и писцом «mov [rsi+378],ecx»
 -- три соседних записи полей - настоящий источник «mov eax,[rsi+374]» стоит
 -- ещё на 26 байт выше.
-local function sourceTrackRec(cur, track, depth)
+local function sourceTrackRec(cur, track, depth, visited, dbg)
   if depth &lt;= 0 then return nil end
+  visited = visited or {}
+  if visited[cur] then return nil end
+  visited[cur] = true
   local starts = {}
   local st = cur - 1
   local lo = cur - 24
@@ -535,28 +538,38 @@ local function sourceTrackRec(cur, track, depth)
     end
     st = st - 1
   end
-  local neutral = nil
+  table.sort(starts, function(a, b) return a.addr &gt; b.addr end) -- новейшие первыми
+  if dbg ~= nil and #dbg &lt; 60 then
+    local ss = {}
+    for _, ci in ipairs(starts) do
+      ss[#ss + 1] = fmt('+%X:%s', ci.addr - dbg.base, ci.str)
+    end
+    dbg[#dbg + 1] = fmt('[srcTrack] cur=+%X track=%s starts: %s',
+      cur - dbg.base, tostring(track),
+      #ss &gt; 0 and table.concat(ss, ' | ') or 'none')
+  end
   for _, ci in ipairs(starts) do
     local o1 = ci.op1
     if o1 ~= nil and o1.kind == 'reg' and canonReg(o1.reg) == track then
       if ci.mnem == 'lea' then
-        return nil  -- track = вычисленный адрес: значение не копируется
+        -- track = вычисленный адрес: на ЭТОЙ ветви значения нет - к другим
       elseif ci.op2 ~= nil and ci.op2.kind == 'mem' and LOAD_MNEMS[ci.mnem] then
+        if dbg ~= nil and #dbg &lt; 60 then
+          dbg[#dbg + 1] = fmt('[srcTrack] SOURCE: %s at +%X', ci.str, ci.addr - dbg.base)
+        end
         return { mem = ci.op2.mem }
       elseif ci.op2 ~= nil and ci.op2.kind == 'reg' and ci.mnem == 'mov' then
-        local r = sourceTrackRec(ci.addr, canonReg(ci.op2.reg), depth - 1)
+        local r = sourceTrackRec(ci.addr, canonReg(ci.op2.reg), depth - 1, visited, dbg)
         if r ~= nil then return r end
-        -- mov-цепь не подтвердилась: пробуем другие старты
+        -- не подтвердилось - следующая ветвь
       else
-        return nil  -- арифметика на track - значение вычислено, не копия
+        -- арифметика на track: на этой ветви значение вычислено - к другим
       end
     elseif trackNeutral(ci, track) then
-      -- нейтральная: не пишет track - запоминаем ближайшую к cur
-      if neutral == nil or ci.addr &gt; neutral then neutral = ci.addr end
+      -- нейтральная: не пишет track - отдельная ветвь с возвратом при неудаче
+      local r = sourceTrackRec(ci.addr, track, depth - 1, visited, dbg)
+      if r ~= nil then return r end
     end
-  end
-  if neutral ~= nil then
-    return sourceTrackRec(neutral, track, depth - 1)
   end
   return nil
 end
@@ -2145,8 +2158,13 @@ end
   -- окно findPredecessors теряло настоящую загрузку среди мусорных декодов
   -- при большом WALK_SCAN)
   if mem.disp == 0 and mem.index == nil and src.kind == 'reg' then
-    local srcMem = sourceTrackRec(ins.addr, src.reg, 12)
+    local dbg = { base = ins.addr }
+    local srcMem = sourceTrackRec(ins.addr, src.reg, 12, nil, dbg)
     local foundMem = srcMem and srcMem.mem or nil
+    if foundMem == nil and #dbg &gt; 0 then
+      -- v2.20: диагностика отказа walk-back - видно, где цепь теряется
+      for _, ln in ipairs(dbg) do log(ln) end
+    end
 
     if foundMem ~= nil and foundMem.base ~= nil and not foundMem.hasRip then
       local baseVal = regVal(ev.ctx, foundMem.base)
@@ -2748,19 +2766,37 @@ local function processHit(ev)
             -- лог 223037: рубильник вынес САМ ДАТЧИК (level-0 watch в той же
             -- странице) — без него поиск слеп, а мусорные writer-декоды
             -- («add [rax],al» от живого guard'а) заводили ветки в тупик.
-            ABF.pageBanned[pg] = true
-            local removedN = 0
+            -- v2.19.2: страница с НАШИМ access-watch - ЖИВАЯ СТРУКТУРА, не
+            -- мусор (Serpent Gaze 225557: страница держателя очков читается
+            -- 20+/с виртуальными вызовами call [rax+360], бан отключал
+            -- neighbor-discovery ровно там, где структуры настоящие). Не
+            -- баним, а помечаем hot-page: flood-гейт и neighborSeen-дедуп
+            -- держат CPU под контролем.
+            local ourWatchHere = false
             for wa, w2 in pairs(ABF.watches) do
-              if wa - wa % 0x1000 == pg
-                  and not (w2.kind == 'write' and wa == ABF.rootAddr)
-                  and (w2.lastDisc == nil or now() - w2.lastDisc &gt; 60000) then
-                removeWatch(wa)
-                removedN = removedN + 1
+              if w2.kind ~= 'write' and wa - wa % 0x1000 == pg then
+                ourWatchHere = true
+                break
               end
             end
-            if removedN &gt; 0 then
-              log(fmt('[!] page storm at page %X (RIP %X "%s"): page banned for this run, %d watch(es) removed (sensor kept)',
-                pg, ev.rip, ins.str, removedN))
+            if ourWatchHere then
+              log(fmt('[!] page storm at page %X - it holds our watchpoint(s), kept alive (neighbors capped per page)',
+                pg))
+            else
+              ABF.pageBanned[pg] = true
+              local removedN = 0
+              for wa, w2 in pairs(ABF.watches) do
+                if wa - wa % 0x1000 == pg
+                    and not (w2.kind == 'write' and wa == ABF.rootAddr)
+                    and (w2.lastDisc == nil or now() - w2.lastDisc &gt; 60000) then
+                  removeWatch(wa)
+                  removedN = removedN + 1
+                end
+              end
+              if removedN &gt; 0 then
+                log(fmt('[!] page storm at page %X (RIP %X "%s"): page banned for this run, %d watch(es) removed (sensor kept)',
+                  pg, ev.rip, ins.str, removedN))
+              end
             end
           end
           -- v2.19: NEIGHBOR-DISCOVERY. Page-хит с декодируемым mem-операндом
@@ -2774,6 +2810,10 @@ local function processHit(ev)
               and not ABF.neighborSeen[eff]
               and eff &gt; 0x10000 and not isStackish(eff) then
             ABF.neighborSeen[eff] = true
+            -- v2.19.2: кап на страницу (hot-страницы с нашими watch больше не
+            -- банятся - ограничиваем число neighbor-watch вместо бана)
+            ABF.neighborPerPage[pg] = (ABF.neighborPerPage[pg] or 0) + 1
+            if ABF.neighborPerPage[pg] &gt; 4 then return end
             local wPage, nBr = nil, nil
             for wa, w2 in pairs(ABF.watches) do
               if w2.kind ~= 'write' and wa - wa % 0x1000 == pg then
@@ -3769,6 +3809,7 @@ local function startSearch()
   ABF.progressHits = 0  -- v2.16: baseline хитов для stuck-гейта
   ABF.pageHits = {}    -- v2.19: активность страниц (neighbor-хиты) - защита веток
   ABF.neighborSeen = {} -- v2.19: дедуп neighbor-watch'ей
+  ABF.neighborPerPage = {} -- v2.19.2: кап neighbor-watch на страницу
   ABF.neighborLogN = 0
   ABF.burstEnds = 0
   ABF.nextBurstAt = 0
