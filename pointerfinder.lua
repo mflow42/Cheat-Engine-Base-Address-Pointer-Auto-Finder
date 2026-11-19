@@ -1,5 +1,5 @@
 --============================================================================
--- Pointer Finder v2.19 (scan-walk) for Cheat Engine 7.4+ (incl. 7.7), x64 games —
+-- Pointer Finder v2.19.1 (scan-walk) for Cheat Engine 7.4+ (incl. 7.7), x64 games —
 -- part of the 'Cheat Engine Base Address Pointer Auto Finder' project.
 -- Код грузится загрузчиком из CT (abfReload) — обновляется без переоткрытия CE
 --
@@ -30,7 +30,7 @@ ABF = {}
 _G.__PointerFinder = ABF
 
 ------------------------------------------------------------------ настройки
-ABF.VERSION        = '2.19' -- версия для заставки и диагностики
+ABF.VERSION        = '2.19.1' -- версия для заставки и диагностики
 ABF.MAX_DEPTH      = 30     -- максимум оффсетов в цепочке (UE-цепи бывают до 10:
                             -- GUObjectArray -> UObject -> Outer -> ...; Serpent
                             -- Gaze упирался в 8 и резал живой путь)
@@ -469,32 +469,72 @@ local BULK_MNEMS = {
 -- вплотную (окно 24 байта, st+sz == cur) и семантически: mov track,[mem] =
 -- ИСТОЧНИК; mov track,reg2 = продолжаем через reg2 (рекурсия с бэктрекингом);
 -- lea/арифметика = значение вычислено - НЕ копия (кандидат пропускается).
+-- v2.19.1: инструкция НЕ пишет track и не ломает линейный поток - её можно
+-- пропустить при движении назад (Serрent Gaze: между «mov ecx,eax» и писцом
+-- стоят три соседних записи полей: mov [rsi+380],rdi / mov [rsi+37C],edi /
+-- mov [rsp+A0],rbx - цепь ecx<-eax разорвана, строгого прилегания мало).
+local function trackNeutral(ci, track)
+  if ci.mnem == 'jmp' or ci.mnem == 'ret' or ci.mnem == 'call' then
+    return false  -- поток прыгает - линейный walk-back дальше недостоверен
+  end
+  local c = ci.mnem:sub(1, 1)
+  if c == 'j' then return false end  -- все jcc - прыжки
+  local o1 = ci.op1
+  if o1 ~= nil and o1.kind == 'reg' and canonReg(o1.reg) == track then
+    return false  -- сама пишет track - это writer, не нейтральная
+  end
+  return true
+end
+
+-- v2.19: ЦЕПНОЙ walk-back источника значения. Плоское окно findPredecessors
+-- при WALK_SCAN 512 собирает сотни мусорных декодов с невыровненных стартов -
+-- настоящая «mov reg,[mem]» теряется среди мусора (регресс 204514: «copy:
+-- could not find the source instruction», при том что с окном 24 копи-ветка
+-- мгновенно находила источник). Каждый шаг ищет предшественника ТОЛЬКО
+-- вплотную (окно 24 байта, st+sz == cur, т.е. конец декодированной инструкции
+-- точно совпадает с началом текущей) и семантически: mov track,[mem] =
+-- ИСТОЧНИК; mov track,other-reg = продолжаем через другой регистр (рекурсия
+-- с бэктрекингом); lea/арифметика = значение вычислено - НЕ копия.
+-- v2.19.1: если ПРЯМО перед текущей никто не пишет track - пропускаем
+-- ближайшую НЕЙТРАЛЬНУЮ инструкцию (не пишет track, не прыжок) и продолжаем:
+-- Serpent Gaze 171552/215940: между «mov ecx,eax» и писцом «mov [rsi+378],ecx»
+-- три соседних записи полей - настоящий источник «mov eax,[rsi+374]» стоит
+-- ещё на 26 байт выше.
 local function sourceTrackRec(cur, track, depth)
   if depth <= 0 then return nil end
-  local candidates = {}
+  local starts = {}
   local st = cur - 1
   local lo = cur - 24
   while st >= lo do
     local sz = safeInstrSize(st)
     if sz ~= nil and st + sz == cur then
       local ci = parseInstruction(st)
-      if ci ~= nil and ci.op1 ~= nil and ci.op1.kind == 'reg'
-          and canonReg(ci.op1.reg) == track then
-        candidates[#candidates + 1] = ci
-      end
+      if ci ~= nil then starts[#starts + 1] = ci end
     end
     st = st - 1
   end
-  for _, ci in ipairs(candidates) do
-    if ci.mnem == 'lea' then
-      -- адрес, не значение: этот кандидат тупиковый - пробуем другие старты
-    elseif ci.op2 ~= nil and ci.op2.kind == 'mem' and LOAD_MNEMS[ci.mnem] then
-      return { mem = ci.op2.mem }
-    elseif ci.op2 ~= nil and ci.op2.kind == 'reg' and ci.mnem == 'mov' then
-      local r = sourceTrackRec(ci.addr, canonReg(ci.op2.reg), depth - 1)
-      if r ~= nil then return r end
-      -- не подтвердилось: следующий валидный старт
+  local neutral = nil
+  for _, ci in ipairs(starts) do
+    local o1 = ci.op1
+    if o1 ~= nil and o1.kind == 'reg' and canonReg(o1.reg) == track then
+      if ci.mnem == 'lea' then
+        return nil  -- track = вычисленный адрес: значение не копируется
+      elseif ci.op2 ~= nil and ci.op2.kind == 'mem' and LOAD_MNEMS[ci.mnem] then
+        return { mem = ci.op2.mem }
+      elseif ci.op2 ~= nil and ci.op2.kind == 'reg' and ci.mnem == 'mov' then
+        local r = sourceTrackRec(ci.addr, canonReg(ci.op2.reg), depth - 1)
+        if r ~= nil then return r end
+        -- mov-цепь не подтвердилась: пробуем другие старты
+      else
+        return nil  -- арифметика на track - значение вычислено, не копия
+      end
+    elseif trackNeutral(ci, track) then
+      -- нейтральная: не пишет track - запоминаем ближайшую к cur
+      if neutral == nil or ci.addr > neutral then neutral = ci.addr end
     end
+  end
+  if neutral ~= nil then
+    return sourceTrackRec(neutral, track, depth - 1)
   end
   return nil
 end
