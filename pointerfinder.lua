@@ -1,5 +1,5 @@
 --============================================================================
--- Pointer Finder v2.12 (scan-walk) for Cheat Engine 7.4+ (incl. 7.7), x64 games —
+-- Pointer Finder v2.13 (scan-walk) for Cheat Engine 7.4+ (incl. 7.7), x64 games —
 -- part of the 'Cheat Engine Base Address Pointer Auto Finder' project.
 -- Код грузится загрузчиком из CT (abfReload) — обновляется без переоткрытия CE
 --
@@ -30,8 +30,8 @@ ABF = {}
 _G.__PointerFinder = ABF
 
 ------------------------------------------------------------------ настройки
-ABF.VERSION        = '2.12' -- версия для заставки и диагностики
-ABF.MAX_DEPTH      = 10     -- максимум оффсетов в цепочке (UE-цепи бывают до 10:
+ABF.VERSION        = '2.13' -- версия для заставки и диагностики
+ABF.MAX_DEPTH      = 30     -- максимум оффсетов в цепочке (UE-цепи бывают до 10:
                             -- GUObjectArray -> UObject -> Outer -> ...; Serpent
                             -- Gaze упирался в 8 и резал живой путь)
 ABF.MAX_WATCH      = 3      -- только debug-регистры (page-метод роняет игры).
@@ -3388,6 +3388,17 @@ local function startSearch()
   ABF.lastGhostCount = nil
   ABF.pendingExt = 0
   ABF.serveWarned = nil
+  -- v2.13: лимит глубины с экрана (3-64; дефолт 30). Клампится, мусорный
+  -- ввод молча даёт дефолт.
+  do
+    local lim = tonumber(ABF.edDepth ~= nil and ABF.edDepth.Text or '')
+    if lim ~= nil and lim >= 3 and lim <= 64 then
+      ABF.MAX_DEPTH = math.floor(lim)
+    else
+      ABF.MAX_DEPTH = 30
+    end
+    log(fmt('[i] depth limit: %d', ABF.MAX_DEPTH))
+  end
   log(fmt('[=] start: address %X, type %s, current value %s', addr, tn, tostring(cur)))
 
   local ifc = debug_getCurrentDebuggerInterface()
@@ -3559,7 +3570,7 @@ local function startSearch()
   ABF.recoveryGrace = 0
   ABF.graceAt = nil
   ABF.graceLogAt = nil
-  if ABF.lblDepth ~= nil then ABF.lblDepth.Caption = 'Max depth: 0' end
+  if ABF.lblDepth ~= nil then ABF.lblDepth.Caption = 'Max depth reached: 0' end
   ABF.btnAdd.Enabled = false
 
   buildWritableMap()
@@ -3750,9 +3761,24 @@ local function buildForm()
   -- v1.69: на отдельной строке и во всю ширину — длинный адрес объекта
   -- иначе выезжает за край формы
   local lblDepth = createLabel(form)
-  lblDepth.Left, lblDepth.Top = 12, 177
-  lblDepth.Width = 636
-  lblDepth.Caption = 'Max depth: 0'
+  lblDepth.Left, lblDepth.Top = 150, 177
+  lblDepth.Width = 498
+  lblDepth.Caption = 'Max depth reached: 0'
+  -- v2.13: лимит глубины настраивается на экране (Serpent Gaze упирался в 10;
+  -- UE-цепи бывают до 10-14 хопов, но интерьерные лестницы длиннее = мусор).
+  -- Аварийный тормоз остаётся: самоссылающиеся структуры (+0 self-reference)
+  -- без лимита дают бесконечный подъём.
+  local lblLimit = createLabel(form)
+  lblLimit.Left, lblLimit.Top = 12, 177
+  lblLimit.Width = 80
+  lblLimit.Caption = 'Depth limit:'
+  local edDepth = createEdit(form)
+  edDepth.Left, edDepth.Top, edDepth.Width = 92, 173, 50
+  edDepth.Text = '30'
+  edDepth.ShowHint = true
+  edDepth.Hint = 'Max pointer hops to climb (3-64). Default 30 is enough for UE games;\n'..
+    'longer chains are almost always interior ladders (garbage).'
+  ABF.edDepth = edDepth
 
   local memo = createMemo(form)
   memo.Left, memo.Top, memo.Width, memo.Height = 12, 196, 636, 336
