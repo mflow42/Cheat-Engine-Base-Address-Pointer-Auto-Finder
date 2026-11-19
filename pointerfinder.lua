@@ -1,5 +1,5 @@
 --============================================================================
--- Pointer Finder v2.14 (scan-walk) for Cheat Engine 7.4+ (incl. 7.7), x64 games —
+-- Pointer Finder v2.15 (scan-walk) for Cheat Engine 7.4+ (incl. 7.7), x64 games —
 -- part of the 'Cheat Engine Base Address Pointer Auto Finder' project.
 -- Код грузится загрузчиком из CT (abfReload) — обновляется без переоткрытия CE
 --
@@ -30,7 +30,7 @@ ABF = {}
 _G.__PointerFinder = ABF
 
 ------------------------------------------------------------------ настройки
-ABF.VERSION        = '2.14' -- версия для заставки и диагностики
+ABF.VERSION        = '2.15' -- версия для заставки и диагностики
 ABF.MAX_DEPTH      = 30     -- максимум оффсетов в цепочке (UE-цепи бывают до 10:
                             -- GUObjectArray -> UObject -> Outer -> ...; Serpent
                             -- Gaze упирался в 8 и резал живой путь)
@@ -2110,6 +2110,64 @@ end
   local w0 = ABF.watches[ABF.rootAddr]
   if w0 ~= nil then w0.lastDisc = now() end  -- v1.97: продуктивный сенсор не убивать
   ABF.lastProgress = now()  -- v1.97
+
+  -- v2.15: SOURCE-TRACKING для писцов С ОФФСЕТОМ. Введённый адрес может быть
+  -- КОПИЕЙ (HUD-зеркало): цепь к ней валидна, но правка значения не влияет на
+  -- игру - логика читает источник (Serpent Gaze 144226: писец
+  -- «mov [rsi+378],ecx» - поле +378 копируется из другого объекта).
+  -- Walk-back по регистру-источнику (mov [base+disp],ecx -> ecx откуда?):
+  -- если нашли «mov ecx,[mem]», адрес источника валиден и его ЗНАЧЕНИЕ
+  -- совпадает с датчиком (в пределах допуска) - это копия: клайм строим
+  -- К ИСТОЧНИКУ, прямой путь к копии не строим вовсе. Совпадения нет /
+  -- walk-back не нашёл загрузку / srcAddr == сам датчик (read-modify-write
+  -- настоящего хранилища) - это настоящее хранилище, обычный путь.
+  if src ~= nil and src.kind == 'reg' and mem.disp ~= 0 then
+    local preds = findPredecessors(ins.addr)
+    local track = canonReg(src.reg)
+    local srcMem = nil
+    for _, ci in ipairs(preds) do
+      local o1, o2 = ci.op1, ci.op2
+      if o1.kind == 'reg' and canonReg(o1.reg) == track then
+        if ci.mnem == 'lea' then
+          break  -- грузят адрес, а не значение — не копия
+        elseif o2.kind == 'mem' and LOAD_MNEMS[ci.mnem] then
+          srcMem = o2.mem
+          break
+        elseif o2.kind == 'reg' and ci.mnem == 'mov' then
+          track = canonReg(o2.reg)  -- mov track,other — продолжаем назад
+        else
+          break  -- арифметика/другая запись в track — значение вычислено, не копия
+        end
+      end
+    end
+    if srcMem ~= nil and srcMem.base ~= nil and not srcMem.hasRip then
+      local srcBase = regVal(ev.ctx, srcMem.base)
+      if srcBase ~= nil then
+        local srcAddr = srcBase + srcMem.disp
+        local srcKey = fmt('%X|%X', ins.addr, srcAddr)
+        if srcAddr ~= m.addr and srcAddr ~= ABF.rootAddr and srcAddr > 0x10000
+            and not isStackish(srcAddr) and not ABF.srcSeen[srcKey] then
+          ABF.srcSeen[srcKey] = true
+          local okS, sVal = pcall(readTyped, srcAddr, ABF.typeName)
+          local okW, wVal = pcall(readTyped, m.addr, ABF.typeName)
+          local tol = math.max(4, math.abs(wVal or 0) * 0.02)
+          if okS and sVal ~= nil and okW and wVal ~= nil
+              and math.abs(sVal - wVal) <= tol then
+            log('[+] level 0: WRITER COPIES the value from another storage')
+            log(fmt('    value source: [%s] -> address %X (base %X + offset %X)',
+              srcMem.str, srcAddr, srcBase, srcMem.disp))
+            log('[+] the chain will be built to the SOURCE (edits there affect the game), '..
+              'not to the copy you entered')
+            setStatus('Found the real storage behind your address - climbing from it')
+            ABF.lastProgress = now()
+            climb({ obj = srcBase, offsets = { srcMem.disp }, ctx = ev.ctx })
+            return
+          end
+        end
+      end
+    end
+  end
+
   climb({ obj = baseVal, offsets = { mem.disp }, ctx = ev.ctx })
 end
 
@@ -3561,6 +3619,7 @@ local function startSearch()
   ABF.lastCopyParent = nil
   ABF.copyWalkFailRip = nil
   ABF.directTried = {}
+  ABF.srcSeen = {}  -- v2.15: обработанные пары (писец, источник) — дедуп спама
   ABF.burstEnds = 0
   ABF.nextBurstAt = 0
   ABF.rspSeen = {}
