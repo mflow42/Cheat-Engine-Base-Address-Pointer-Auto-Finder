@@ -1,5 +1,5 @@
 --============================================================================
--- Pointer Finder v2.11 (scan-walk) for Cheat Engine 7.4+ (incl. 7.7), x64 games —
+-- Pointer Finder v2.12 (scan-walk) for Cheat Engine 7.4+ (incl. 7.7), x64 games —
 -- part of the 'Cheat Engine Base Address Pointer Auto Finder' project.
 -- Код грузится загрузчиком из CT (abfReload) — обновляется без переоткрытия CE
 --
@@ -30,8 +30,10 @@ ABF = {}
 _G.__PointerFinder = ABF
 
 ------------------------------------------------------------------ настройки
-ABF.VERSION        = '2.11' -- версия для заставки и диагностики
-ABF.MAX_DEPTH      = 8      -- максимум оффсетов в цепочке
+ABF.VERSION        = '2.12' -- версия для заставки и диагностики
+ABF.MAX_DEPTH      = 10     -- максимум оффсетов в цепочке (UE-цепи бывают до 10:
+                            -- GUObjectArray -> UObject -> Outer -> ...; Serpent
+                            -- Gaze упирался в 8 и резал живой путь)
 ABF.MAX_WATCH      = 3      -- только debug-регистры (page-метод роняет игры).
                             -- v1.99: было 4, но VEH держит один DR под степпинг —
                             -- 4-й watch CE обслуживает page-guard'ом; на горячей
@@ -600,17 +602,39 @@ end
 -- стековая копия проходила фильтр, CE ставил её в page-метод, и поток-писец
 -- устраивал шторм на 8 минут (лог 023153: 94k хитов, ноль прогресса).
 local function isStackish(addr)
+  -- v2.12: тегированные указатели (GC-флаги в младших битах — UE/Go/Java-стиль)
+  -- маскируются, иначе стековый адрес с тегом (…101) не узнаётся.
+  addr = addr & ~7
+  -- v2.12: окно ±64 МБ вокруг виденных RSP. Стеки соседних потоков аллоцируются
+  -- рядом (Serpent Gaze 011925: стековый «объект» C795670101 на 7.3 МБ от RSP
+  -- главного потока — вне старого окна ±2 МБ, весь ложный подъём уровней 3-9
+  -- пошёл ОТ СТЕКА через тегированный указатель). Куча живёт на терабайты
+  -- дальше от стека — окно не задевает настоящих объектов.
   for _, rsp in ipairs(ABF.rspSeen) do
-    if math.abs(addr - rsp) < 0x200000 then return true end
+    if math.abs(addr - rsp) < 0x4000000 then return true end
   end
   -- монотонный набор 2МБ-регионов, виденных с RSP за весь прогон
   local base = addr - addr % 0x200000
   if ABF.stackRegions[base] then return true end
-  -- адрес может лежать в соседнем 2МБ-регионе от виденного (граница стека)
-  if ABF.stackRegions[base - 0x200000] or ABF.stackRegions[base + 0x200000] then
-    return addr % 0x200000 < 0x100000 -- только близко к границе
+  -- v2.12: соседние до ±64 МБ от виденного 2МБ-региона — тоже стек-подозреваемые
+  -- (stackRegions = {[regionBase]=true}: pairs отдаёт КЛЮЧ первым)
+  for seen in pairs(ABF.stackRegions) do
+    if math.abs(base - seen) < 0x4000000 then return true end
   end
   return false
+end
+
+-- v2.12: СВОЯ проверка «в главном модуле игры». Встроенная CE-шная inModule
+-- считает модулем ЛЮБУЮ DLL процесса - включая vehdebug-x86_64.dll (внедрённый
+-- VEH-дебаггер), чьи watchpoint-структуры указывают на наши ячейки: цепь с
+-- якорем «vehdebug-x86_64.dll+41CF0» прошла как модульная (лог 100602).
+-- Якорем может быть только главный exe. Диапазон - из enumModules()[1].
+ABF.mainMod = nil  -- {addr, size, name}, заполняется при Start
+
+local function inMainModule(addr)
+  local m = ABF.mainMod
+  if m == nil then return false end
+  return addr >= m.addr and addr < m.addr + m.size
 end
 
 local function addWatch(addr, kind, size, branch, trigger)
@@ -1647,7 +1671,7 @@ climb = function(state)
     end
     return false
   end
-  if inModule(obj) then
+  if inMainModule(obj) then
     finish(state)
     return true
   end
@@ -1705,7 +1729,7 @@ climb = function(state)
   -- (010403: модульный держатель стоял третьим, лимит 2 обрывал цикл до
   -- проверки — золотая цепь не собиралась полчаса.)
   for _, H in ipairs(holders) do
-    if inModule(H) then
+    if inMainModule(H) then
       local newOffs = {}
       for i, o in ipairs(state.offsets) do newOffs[i] = o end
       insert(newOffs, 0)
@@ -1715,15 +1739,19 @@ climb = function(state)
     end
   end
   -- затем интерьерные родители (сканы), с бюджетом
+  -- v2.12: лимит 3 → 6 статических родителей на уровень. Serpent Gaze 093218:
+  -- у объекта уровня 1 было 10 держателей, исследование останавливалось после
+  -- 3-го — 7 держателей оставались неопрошенными (уровень-2 ветка в их цепях
+  -- могла вести к модулю).
   for _, H in ipairs(holders) do
-    if inModule(H) then
+    if inMainModule(H) then
       -- уже обработан выше
-    elseif walkStarted >= 3 then
+    elseif walkStarted >= 6 then
       break
     else
       local parents = scanNearPointer(H)
       for _, cand in ipairs(parents) do
-        if walkStarted >= 3 then break end
+        if walkStarted >= 6 then break end
         local P, disp = cand[1], cand[2]
         -- v2.01: стековых «родителей» отсекаем до climb — они жгли бюджет
         -- сканов (010403: +28/+38/+48/+58 — все кадры стека)
@@ -2110,7 +2138,7 @@ local function handleAccessHit(ins, ev, m, w)
       local newOffs = {}
       for i, o in ipairs(br.offsets) do newOffs[i] = o end
       insert(newOffs, 0)
-      if inModule(m.addr) then
+      if inMainModule(m.addr) then
         log(fmt('[+] holder %X is a static module cell (depth %d) — assembling the chain',
           m.addr, #newOffs + 1))
       end
@@ -3381,6 +3409,26 @@ local function startSearch()
       tostring(ps), tostring(ps2)))
   else
     log(fmt('[i] pointer size: %d', ps))
+  end
+
+  -- v2.12: главный модуль процесса — ЕДИНСТВЕННЫЙ допустимый якорь цепи.
+  -- Встроенная inModule CE считает модулем любую DLL (включая
+  -- vehdebug-x86_64.dll — внедрённый отладчик, чьи структуры указывают на
+  -- наши ячейки — гарантированная ложная цепь при VEH-attach, лог 100602).
+  ABF.mainMod = nil
+  do
+    local okm, mods = pcall(enumModules)
+    if okm and type(mods) == 'table' and #mods > 0 and mods[1].Address ~= nil then
+      ABF.mainMod = {
+        addr = mods[1].Address,
+        size = mods[1].Size or 0,
+        name = tostring(mods[1].Name or ''),
+      }
+      log(fmt('[i] main module: %s @ %X (%d KB) - chains anchor here only',
+        ABF.mainMod.name, ABF.mainMod.addr, ABF.mainMod.size // 1024))
+    else
+      log('[!] enumModules unavailable - falling back to CE inModule semantics')
+    end
   end
 
   ABF.processed   = {}
