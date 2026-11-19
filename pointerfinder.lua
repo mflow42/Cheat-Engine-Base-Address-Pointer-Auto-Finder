@@ -1,5 +1,5 @@
 --============================================================================
--- Pointer Finder v2.16 (scan-walk) for Cheat Engine 7.4+ (incl. 7.7), x64 games —
+-- Pointer Finder v2.17 (scan-walk) for Cheat Engine 7.4+ (incl. 7.7), x64 games —
 -- part of the 'Cheat Engine Base Address Pointer Auto Finder' project.
 -- Код грузится загрузчиком из CT (abfReload) — обновляется без переоткрытия CE
 --
@@ -30,7 +30,7 @@ ABF = {}
 _G.__PointerFinder = ABF
 
 ------------------------------------------------------------------ настройки
-ABF.VERSION        = '2.16' -- версия для заставки и диагностики
+ABF.VERSION        = '2.17' -- версия для заставки и диагностики
 ABF.MAX_DEPTH      = 30     -- максимум оффсетов в цепочке (UE-цепи бывают до 10:
                             -- GUObjectArray -> UObject -> Outer -> ...; Serpent
                             -- Gaze упирался в 8 и резал живой путь)
@@ -612,6 +612,14 @@ local function isStackish(addr)
   -- дальше от стека — окно не задевает настоящих объектов.
   for _, rsp in ipairs(ABF.rspSeen) do
     if math.abs(addr - rsp) < 0x4000000 then return true end
+  end
+  -- v2.17: СТЕКИ ДРУГИХ ПОТОКОВ в 1-2 ГБ от виденных RSP. Serpent Gaze 171552:
+  -- стек соседнего потока B693729588 на 1.76 ГБ от RSP главного (B6FC97B910) -
+  -- вне ±64 МБ, и ВСЯ лестница уровней 3-19 ползла по стекам потоков (149
+  -- пустых держателей → wipe). Стеки потоков Windows аллоцируются кучей в
+  -- пределах пары ГБ; данные (куча) - на терабайты дальше, окно их не задевает.
+  for _, rsp in ipairs(ABF.rspSeen) do
+    if math.abs(addr - rsp) < 0x80000000 then return true end
   end
   -- монотонный набор 2МБ-регионов, виденных с RSP за весь прогон
   local base = addr - addr % 0x200000
