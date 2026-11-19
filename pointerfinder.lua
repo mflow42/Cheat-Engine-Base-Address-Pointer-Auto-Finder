@@ -1,5 +1,5 @@
 --============================================================================
--- Pointer Finder v2.18 (scan-walk) for Cheat Engine 7.4+ (incl. 7.7), x64 games —
+-- Pointer Finder v2.19 (scan-walk) for Cheat Engine 7.4+ (incl. 7.7), x64 games —
 -- part of the 'Cheat Engine Base Address Pointer Auto Finder' project.
 -- Код грузится загрузчиком из CT (abfReload) — обновляется без переоткрытия CE
 --
@@ -30,7 +30,7 @@ ABF = {}
 _G.__PointerFinder = ABF
 
 ------------------------------------------------------------------ настройки
-ABF.VERSION        = '2.18' -- версия для заставки и диагностики
+ABF.VERSION        = '2.19' -- версия для заставки и диагностики
 ABF.MAX_DEPTH      = 30     -- максимум оффсетов в цепочке (UE-цепи бывают до 10:
                             -- GUObjectArray -> UObject -> Outer -> ...; Serpent
                             -- Gaze упирался в 8 и резал живой путь)
@@ -42,7 +42,7 @@ ABF.MAX_WATCH      = 3      -- только debug-регистры (page-мет�
 ABF.MAX_HOLDERS    = 3      -- держателей указателя на один объект
 ABF.MAX_BRANCHES   = 64     -- одновременных веток подъёма
 ABF.WALK_BACK      = 6      -- сколько инструкций назад разбирать при копии
-ABF.WALK_SCAN      = 512     -- окно поиска назад от RIP, байт
+ABF.WALK_SCAN      = 24     -- окно поиска назад от RIP, байт
 ABF.QUEUE_MAX      = 128    -- предел очереди хитов
 ABF.BRANCH_IDLE_MS = 180000 -- ветка без хитов столько мс закрывается (должна переживать паузы между изменениями денег)
 ABF.PROC_PER_TICK  = 24     -- хитов на тик таймера
@@ -461,6 +461,44 @@ local BULK_MNEMS = {
   stosb=true, stosd=true, stosq=true,
 }
 
+-- v2.19: ЦЕПНОЙ walk-back источника значения. Плоское окно findPredecessors
+-- при WALK_SCAN 512 собирает сотни мусорных декодов с невыровненных стартов -
+-- настоящая «mov reg,[mem]» теряется среди мусора (регресс 204514: «copy:
+-- could not find the source instruction», при том что с окном 24 копи-ветка
+-- мгновенно находила источник). Каждый шаг ищет предшественника ТОЛЬКО
+-- вплотную (окно 24 байта, st+sz == cur) и семантически: mov track,[mem] =
+-- ИСТОЧНИК; mov track,reg2 = продолжаем через reg2 (рекурсия с бэктрекингом);
+-- lea/арифметика = значение вычислено - НЕ копия (кандидат пропускается).
+local function sourceTrackRec(cur, track, depth)
+  if depth <= 0 then return nil end
+  local candidates = {}
+  local st = cur - 1
+  local lo = cur - 24
+  while st >= lo do
+    local sz = safeInstrSize(st)
+    if sz ~= nil and st + sz == cur then
+      local ci = parseInstruction(st)
+      if ci ~= nil and ci.op1 ~= nil and ci.op1.kind == 'reg'
+          and canonReg(ci.op1.reg) == track then
+        candidates[#candidates + 1] = ci
+      end
+    end
+    st = st - 1
+  end
+  for _, ci in ipairs(candidates) do
+    if ci.mnem == 'lea' then
+      -- адрес, не значение: этот кандидат тупиковый - пробуем другие старты
+    elseif ci.op2 ~= nil and ci.op2.kind == 'mem' and LOAD_MNEMS[ci.mnem] then
+      return { mem = ci.op2.mem }
+    elseif ci.op2 ~= nil and ci.op2.kind == 'reg' and ci.mnem == 'mov' then
+      local r = sourceTrackRec(ci.addr, canonReg(ci.op2.reg), depth - 1)
+      if r ~= nil then return r end
+      -- не подтвердилось: следующий валидный старт
+    end
+  end
+  return nil
+end
+
 ------------------------------------------------------------------ watchpoints
 ABF.watches    = {}
 ABF.watchOrder = {}
@@ -630,6 +668,14 @@ local function isStackish(addr)
     if math.abs(base - seen) < 0x4000000 then return true end
   end
   return false
+end
+
+-- v2.19: СТРАНИЦА АДРЕСА АКТИВНА (игра читает соседние ячейки)? Page-хиты
+-- доказывают жизнь структуры даже когда DR-хиты на сам watch не идут
+-- (watch деградировал в page-метод / атрибуция невозможна).
+local function pageActive(addr)
+  local at = ABF.pageHits[addr - addr % 0x1000]
+  return at ~= nil and now() - at < 90000
 end
 
 -- v2.12: СВОЯ проверка «в главном модуле игры». Встроенная CE-шная inModule
@@ -2033,25 +2079,12 @@ end
   local src = (m.opi == 1) and ins.op2 or ins.op1
 
   -- копия без оффсета: mov [base],reg — ищем, откуда взяли reg
+  -- v2.19: через sourceTrackRec - цепной walk-back с бэктрекингом (плоское
+  -- окно findPredecessors теряло настоящую загрузку среди мусорных декодов
+  -- при большом WALK_SCAN)
   if mem.disp == 0 and mem.index == nil and src.kind == 'reg' then
-    local preds = findPredecessors(ins.addr)
-    local track = canonReg(src.reg)
-    local foundMem = nil
-    for _, ci in ipairs(preds) do
-      local o1, o2 = ci.op1, ci.op2
-      if o1.kind == 'reg' and canonReg(o1.reg) == track then
-        if ci.mnem == 'lea' then
-          break  -- грузят адрес, а не значение — копии нет
-        elseif o2.kind == 'mem' and LOAD_MNEMS[ci.mnem] then
-          foundMem = o2.mem
-          break
-        elseif o2.kind == 'reg' and ci.mnem == 'mov' then
-          track = canonReg(o2.reg)  -- mov track,other — идём дальше назад
-        else
-          break  -- незнакомая запись в track (xor rax,rax и т.п.)
-        end
-      end
-    end
+    local srcMem = sourceTrackRec(ins.addr, src.reg, 12)
+    local foundMem = srcMem and srcMem.mem or nil
 
     if foundMem ~= nil and foundMem.base ~= nil and not foundMem.hasRip then
       local baseVal = regVal(ev.ctx, foundMem.base)
@@ -2149,24 +2182,7 @@ end
   -- walk-back не нашёл загрузку / srcAddr == сам датчик (read-modify-write
   -- настоящего хранилища) - это настоящее хранилище, обычный путь.
   if src ~= nil and src.kind == 'reg' and mem.disp ~= 0 then
-    local preds = findPredecessors(ins.addr)
-    local track = canonReg(src.reg)
-    local srcMem = nil
-    for _, ci in ipairs(preds) do
-      local o1, o2 = ci.op1, ci.op2
-      if o1.kind == 'reg' and canonReg(o1.reg) == track then
-        if ci.mnem == 'lea' then
-          break  -- грузят адрес, а не значение — не копия
-        elseif o2.kind == 'mem' and LOAD_MNEMS[ci.mnem] then
-          srcMem = o2.mem
-          break
-        elseif o2.kind == 'reg' and ci.mnem == 'mov' then
-          track = canonReg(o2.reg)  -- mov track,other — продолжаем назад
-        else
-          break  -- арифметика/другая запись в track — значение вычислено, не копия
-        end
-      end
-    end
+    local srcMem = sourceTrackRec(ins.addr, src.reg, 12)
     if srcMem ~= nil and srcMem.base ~= nil and not srcMem.hasRip then
       local srcBase = regVal(ev.ctx, srcMem.base)
       if srcBase ~= nil then
@@ -2685,6 +2701,38 @@ local function processHit(ev)
                 pg, ev.rip, ins.str, removedN))
             end
           end
+          -- v2.19: NEIGHBOR-DISCOVERY. Page-хит с декодируемым mem-операндом
+          -- несёт адрес соседней ячейки страницы держателя: игра её ЧИТАЕТ -
+          -- она часть той же живой структуры (Serpent Gaze 194922: 5800
+          -- neighbor-хитов с страниц 18 живых держателей уровня 1). Помечаем
+          -- активность страницы (защита веток от wipe) и ставим neighbor-watch:
+          -- его DR-хиты дадут точный подъём, которого page-метод не даёт.
+          ABF.pageHits[pg] = tbrk
+          if not ABF.pageBanned[pg] and ABF.watches[eff] == nil
+              and not ABF.neighborSeen[eff]
+              and eff > 0x10000 and not isStackish(eff) then
+            ABF.neighborSeen[eff] = true
+            local wPage, nBr = nil, nil
+            for wa, w2 in pairs(ABF.watches) do
+              if w2.kind ~= 'write' and wa - wa % 0x1000 == pg then
+                wPage = w2
+                break
+              end
+            end
+            if wPage ~= nil then
+              for br in pairs(wPage.branches) do nBr = br; break end
+              if nBr ~= nil then
+                insert(nBr.watchAddrs, eff)
+                if addWatch(eff, 'access', 8, nBr) then
+                  ABF.neighborLogN = (ABF.neighborLogN or 0) + 1
+                  if ABF.neighborLogN <= 8 then
+                    log(fmt('[+] neighbor %X of page %X is read by the game ("%s") - added to the climb',
+                      eff, pg, ins.str))
+                  end
+                end
+              end
+            end
+          end
         end
       end
     end
@@ -2932,7 +2980,7 @@ local function processQueue()
             local w2 = ABF.watches[wa]
             if w2 == nil then
               swUnarmed = swUnarmed + 1
-            elseif w2.kind ~= 'write' and (w2.hits or 0) == 0 then
+            elseif w2.kind ~= 'write' and (w2.hits or 0) == 0 and not pageActive(wa) then
               swUnhit = swUnhit + 1
             end
           end
@@ -3305,7 +3353,7 @@ local function processQueue()
               local w2 = ABF.watches[wa]
               if w2 == nil then
                 unarmed = unarmed + 1
-              elseif w2.kind ~= 'write' and (w2.hits or 0) == 0 then
+              elseif w2.kind ~= 'write' and (w2.hits or 0) == 0 and not pageActive(wa) then
                 unhit = unhit + 1
               end
             end
@@ -3657,6 +3705,9 @@ local function startSearch()
   ABF.directTried = {}
   ABF.srcSeen = {}  -- v2.15: обработанные пары (писец, источник) — дедуп спама
   ABF.progressHits = 0  -- v2.16: baseline хитов для stuck-гейта
+  ABF.pageHits = {}    -- v2.19: активность страниц (neighbor-хиты) - защита веток
+  ABF.neighborSeen = {} -- v2.19: дедуп neighbor-watch'ей
+  ABF.neighborLogN = 0
   ABF.burstEnds = 0
   ABF.nextBurstAt = 0
   ABF.rspSeen = {}
