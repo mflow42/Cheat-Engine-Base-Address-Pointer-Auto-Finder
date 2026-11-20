@@ -1,5 +1,5 @@
 --============================================================================
--- Pointer Finder v2.20 (scan-walk) for Cheat Engine 7.4+ (incl. 7.7), x64 games —
+-- Pointer Finder v2.20.1 (scan-walk) for Cheat Engine 7.4+ (incl. 7.7), x64 games —
 -- part of the 'Cheat Engine Base Address Pointer Auto Finder' project.
 -- Код грузится загрузчиком из CT (abfReload) — обновляется без переоткрытия CE
 --
@@ -30,7 +30,7 @@ ABF = {}
 _G.__PointerFinder = ABF
 
 ------------------------------------------------------------------ настройки
-ABF.VERSION        = '2.20' -- версия для заставки и диагностики
+ABF.VERSION        = '2.20.1' -- версия для заставки и диагностики
 ABF.MAX_DEPTH      = 30     -- максимум оффсетов в цепочке (UE-цепи бывают до 10:
                             -- GUObjectArray -> UObject -> Outer -> ...; Serpent
                             -- Gaze упирался в 8 и резал живой путь)
@@ -992,7 +992,13 @@ local function scanHolders(objAddr)
   if ok and sl ~= nil then
     for i = 0, sl.Count - 1 do
       local a = tonumber(sl[i], 16)
-      if a ~= nil and a ~= objAddr then insert(out, a) end
+      -- v2.20.1: стековые ячейки НЕ держатели (временный указатель в кадре
+      -- потока; Serpent Gaze: из 18 держателей HUD-объекта часть - стек,
+      -- они занимали DR-слоты и никогда не давали цепь). Адрес-ячейка на
+      -- стеке не может быть частью постоянной цепи.
+      if a ~= nil and a ~= objAddr and not isStackish(a) then
+        insert(out, a)
+      end
     end
     pcall(object_destroy, sl)
   end
