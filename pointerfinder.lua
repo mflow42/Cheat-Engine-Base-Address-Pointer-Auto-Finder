@@ -1,5 +1,5 @@
 --============================================================================
--- Pointer Finder v2.20.1 (scan-walk) for Cheat Engine 7.4+ (incl. 7.7), x64 games —
+-- Pointer Finder v2.20.2 (scan-walk) for Cheat Engine 7.4+ (incl. 7.7), x64 games —
 -- part of the 'Cheat Engine Base Address Pointer Auto Finder' project.
 -- Код грузится загрузчиком из CT (abfReload) — обновляется без переоткрытия CE
 --
@@ -30,7 +30,7 @@ ABF = {}
 _G.__PointerFinder = ABF
 
 ------------------------------------------------------------------ настройки
-ABF.VERSION        = '2.20.1' -- версия для заставки и диагностики
+ABF.VERSION        = '2.20.2' -- версия для заставки и диагностики
 ABF.MAX_DEPTH      = 30     -- максимум оффсетов в цепочке (UE-цепи бывают до 10:
                             -- GUObjectArray -> UObject -> Outer -> ...; Serpent
                             -- Gaze упирался в 8 и резал живой путь)
@@ -1917,6 +1917,16 @@ climb = function(state)
 
   log(fmt('[+] level %d: object %X found in %d memory locations, setting access-watchpoints',
     depth, obj, #holders))
+  -- v2.20.2: адреса держателей в лог - по региону (куча/стек/DLL) сразу видно,
+  -- куда лестница может идти (Serpent Gaze: все держатели пула вне модуля -
+  -- аллокаторные пулы без указателей на отдельные объекты)
+  do
+    local hs = {}
+    for k = 1, math.min(#holders, 8) do
+      hs[#hs + 1] = fmt('%X%s', holders[k], inMainModule(holders[k]) and '=MODULE' or '')
+    end
+    log('[i]   holders: ' .. (table.concat(hs, ' ') ~= '' and table.concat(hs, ' ') or 'none'))
+  end
   if depth > ABF.maxDepth then
     ABF.maxDepth = depth
     if ABF.lblDepth ~= nil then
