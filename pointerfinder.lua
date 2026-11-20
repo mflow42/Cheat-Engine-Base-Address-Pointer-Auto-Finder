@@ -1,5 +1,5 @@
 --============================================================================
--- Pointer Finder v2.20.2 (scan-walk) for Cheat Engine 7.4+ (incl. 7.7), x64 games —
+-- Pointer Finder v2.21 (scan-walk) for Cheat Engine 7.4+ (incl. 7.7), x64 games —
 -- part of the 'Cheat Engine Base Address Pointer Auto Finder' project.
 -- Код грузится загрузчиком из CT (abfReload) — обновляется без переоткрытия CE
 --
@@ -30,7 +30,7 @@ ABF = {}
 _G.__PointerFinder = ABF
 
 ------------------------------------------------------------------ настройки
-ABF.VERSION        = '2.20.2' -- версия для заставки и диагностики
+ABF.VERSION        = '2.21' -- версия для заставки и диагностики
 ABF.MAX_DEPTH      = 30     -- максимум оффсетов в цепочке (UE-цепи бывают до 10:
                             -- GUObjectArray -> UObject -> Outer -> ...; Serpent
                             -- Gaze упирался в 8 и резал живой путь)
@@ -58,6 +58,9 @@ ABF.FLOOD_HITS     = 20     -- подавление шторма: больше �
 ABF.FLOOD_WINDOW_MS = 1000  -- RIP за окно — остальные дропаются в callback
 ABF.PAIR_TTL_MS    = 30000  -- дедуп: пара (адрес,RIP) не обрабатывается повторно
 ABF.FLOOD_LOG_MS   = 5000   -- как часто логировать подавленный шторм
+ABF.ALLOC_GIVE_UP_MS = 480000 -- v2.21: столько мс без единого модульного держателя + признаки пулов = allocator-game, стоп
+ABF.ALLOC_MIN_HOLDERS = 20 -- ...минимум держателей для вердикта
+ABF.ALLOC_MIN_NESTED  = 3  -- ...минимум nested-объектов
 ABF.SPEC_TTL_MS    = 8000   -- спекулятивный держатель без хитов столько мс - освобождает слот
 ABF.REAP_TICKS     = 3      -- v2.11: жнец срабатывает после стольких ТИКОВ значения
                             -- без единого хита (держатели статических веток читаются
@@ -1823,12 +1826,19 @@ climb = function(state)
   end
 
   local holders = scanHolders(obj)
+  -- v2.21: счётчики детектора allocator-pool игр (см. watchdog-проверку)
+  if ABF.allocStats ~= nil and depth >= 1 then
+    ABF.allocStats.totalHolders = (ABF.allocStats.totalHolders or 0) + #holders
+  end
   if #holders == 0 then
     -- ВЛОЖЕННЫЙ объект: на него нет указателей в памяти (узел = родитель+off,
     -- адрес вычисляется). Но адрес объекта — это одновременно и слот держателя,
     -- поэтому читатель родительского поля (mov r12,[rbx+10]) ловится
     -- access-watch'ем на САМ адрес объекта.
     log(fmt('[~] no holders for %X (nested object) — placing an access-watch on the address itself', obj))
+    if ABF.allocStats ~= nil and depth >= 1 then
+      ABF.allocStats.nestedBranches = (ABF.allocStats.nestedBranches or 0) + 1
+    end
     local br = newBranch(obj, state.offsets)
     insert(br.watchAddrs, obj)
     if not isStackish(obj) and addWatch(obj, 'access', 8, br) then
@@ -1859,6 +1869,9 @@ climb = function(state)
       for i, o in ipairs(state.offsets) do newOffs[i] = o end
       insert(newOffs, 0)
       log(fmt('[+] scan-walk: holder %X of %X is a static module cell — assembling the chain', H, obj))
+      if ABF.allocStats ~= nil then
+        ABF.allocStats.moduleHolders = (ABF.allocStats.moduleHolders or 0) + 1
+      end
       climb({ obj = H, offsets = newOffs, ctx = state.ctx })
       walkStarted = walkStarted + 1
     end
@@ -3101,6 +3114,39 @@ local function processQueue()
         ABF.lastProgress = t
         startResync('search restarted: the scheduler will rescan right after the next value change.')
       end
+      -- v2.21: ДЕТЕКТОР ALLOCATOR-POOL ИГР. Сигнатура Serpent Gaze (10 часов
+      -- разборов): много держателей, НОЛЬ в главном модуле, пачка nested-объектов
+      -- (allocator выдаёт объекты как pool_base + index - на них не указывают),
+      -- лестница растёт, но якорю не достигнуть. После ALLOC_GIVE_UP_MS честно
+      -- останавливаем поиск и объясняем - вместо часов бесполезного сканирования.
+      do
+        local as = ABF.allocStats
+        if ABF.running and ABF.validating == nil and ABF.resync == nil
+            and as ~= nil and t - as.t0 > ABF.ALLOC_GIVE_UP_MS
+            and (as.moduleHolders or 0) == 0
+            and (as.totalHolders or 0) >= ABF.ALLOC_MIN_HOLDERS
+            and (as.nestedBranches or 0) >= ABF.ALLOC_MIN_NESTED
+            and ABF.maxDepth >= 3 then
+          as.stopped = true
+          log('[!] ================================================================')
+          log('[!] ALLOCATOR-POOL GAME DETECTED - a stable pointer chain does not exist for this value.')
+          log(fmt('[!] %d holder(s) found across the climb, NONE inside the game module;',
+            as.totalHolders or 0))
+          log(fmt('[!] %d object(s) had no pointers to them (nested) - the allocator gives',
+            as.nestedBranches or 0))
+          log('[!] objects as pool_base + index, addresses are computed, not referenced.')
+          log('[!] Pointer chains (game.exe+offset) cannot reach this storage.')
+          log('[!] Search stopped. Practical routes:')
+          log('[!]   - edit the value address you already found (it works in this session);')
+          log('[!]   - between game launches: unknown-scan the value again (2-3 minutes).')
+          log('[!] ================================================================')
+          toast('Allocator-pool game - chains impossible (see log)', 0x0000FF, 2500)
+          setStatus('This game stores the value in allocator pools - stable chains do not exist. See log.')
+          pcall(beep, 300, 400)
+          abfStop()
+          return
+        end
+      end
       -- v1.68: ЖНЕЦ — access-watch без единого хита освобождает DR-слот.
       -- Мусорные ячейки-держатели от старых поколений GC иначе занимают
       -- слоты вечно и душат подъём (подтверждённые хитами не трогаются).
@@ -3801,6 +3847,8 @@ local function startSearch()
   ABF.directTried = {}
   ABF.srcSeen = {}  -- v2.15: обработанные пары (писец, источник) — дедуп спама
   ABF.progressHits = 0  -- v2.16: baseline хитов для stuck-гейта
+  -- v2.21: счётчики детектора allocator-pool игр (сброс на каждый Старт)
+  ABF.allocStats = { t0 = now(), totalHolders = 0, moduleHolders = 0, nestedBranches = 0 }
   ABF.pageHits = {}    -- v2.19: активность страниц (neighbor-хиты) - защита веток
   ABF.neighborSeen = {} -- v2.19: дедуп neighbor-watch'ей
   ABF.neighborPerPage = {} -- v2.19.2: кап neighbor-watch на страницу

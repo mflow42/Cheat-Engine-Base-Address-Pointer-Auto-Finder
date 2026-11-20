@@ -131,6 +131,16 @@ inside the game module (`game.exe+offset`). Two cases where this is not true:
   a hash/id): the tool scans for real pointer references; when nothing in
   memory points at the storage object, no chain can be assembled — this is
   a property of the game, not a search failure.
+- **Allocator-pool games** (computed addresses everywhere): some engines
+  hand out state objects as `pool_base + index` - no pointer ever points at
+  an individual object, HUD values are copies computed by setter code, and
+  every holder cell lives outside the game module. Pointer Finder detects
+  this signature (many holders, none in the module, nested objects without
+  references) after ~8 minutes, **stops the search automatically and
+  explains the verdict in the log** - a stable `game.exe+offset` chain does
+  not exist for such values. Practical route: edit the value address you
+  found in the current session, and repeat a short unknown-scan after each
+  game launch.
 
 In both cases a manual pointer scan in CE will come up equally empty.
 
